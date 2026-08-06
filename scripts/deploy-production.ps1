@@ -2,6 +2,7 @@
 param(
     [string]$FunctionName = "dtlapi",
     [string]$SourceRef = "main",
+    [string]$RoutePath = "/api",
     [switch]$Deploy,
     [switch]$SkipSmokeTest
 )
@@ -198,6 +199,13 @@ function Build-ProductionPackage {
 
 Push-Location $repoRoot
 try {
+    if (-not $RoutePath.StartsWith("/")) {
+        throw "RoutePath must start with /"
+    }
+    if ($RoutePath.Length -gt 1) {
+        $RoutePath = $RoutePath.TrimEnd("/")
+    }
+
     Build-ProductionPackage
 
     $configuration = Read-DotEnv $envPath
@@ -327,15 +335,94 @@ try {
     }
 
     Write-Host "Function is Active/Available."
+
+    $privilege = Invoke-McpTool "queryGateway" @{ action = "getPrivilege" }
+    if (-not $privilege.success) {
+        throw $privilege.message
+    }
+    if (-not $privilege.data.enableService) {
+        $enableResult = Invoke-McpTool "manageGateway" @{
+            action = "enableService"
+            enable = $true
+        }
+        if (-not $enableResult.success) {
+            throw $enableResult.message
+        }
+        Write-Host "Enabled the CloudBase HTTP gateway."
+    }
+
+    $routeList = Invoke-McpTool "queryGateway" @{ action = "listRoutes" }
+    if (-not $routeList.success) {
+        throw $routeList.message
+    }
+    $pathRoute = @(
+        $routeList.data.routes |
+            Where-Object { $_.DomainType -eq "HTTPSERVICE" -and $_.Path -eq $RoutePath }
+    )
+    if ($pathRoute.Count -gt 1) {
+        throw "Multiple HTTP gateway routes already use $RoutePath"
+    }
+    if ($pathRoute -and $pathRoute.UpstreamResourceName -ne $FunctionName) {
+        throw "HTTP gateway route $RoutePath already targets $($pathRoute.UpstreamResourceName)"
+    }
+
+    if (-not $pathRoute) {
+        $routeResult = Invoke-McpTool "manageGateway" @{
+            action = "createRoute"
+            targetName = $FunctionName
+            path = $RoutePath
+            upstreamResourceType = "WEB_SCF"
+            auth = $false
+            enablePathTransmission = $true
+        }
+        if (-not $routeResult.success) {
+            throw $routeResult.message
+        }
+        Write-Host "Created public HTTP gateway route $RoutePath."
+    }
+    elseif (
+        $pathRoute.UpstreamResourceType -ne "WEB_SCF" -or
+        $pathRoute.EnableAuth -or
+        -not $pathRoute.EnablePathTransmission
+    ) {
+        $routeResult = Invoke-McpTool "manageGateway" @{
+            action = "updateRoute"
+            domain = $pathRoute.Domain
+            targetName = $FunctionName
+            path = $RoutePath
+            upstreamResourceType = "WEB_SCF"
+            auth = $false
+            enablePathTransmission = $true
+        }
+        if (-not $routeResult.success) {
+            throw $routeResult.message
+        }
+        Write-Host "Updated public HTTP gateway route $RoutePath."
+    }
+
+    $routeList = Invoke-McpTool "queryGateway" @{ action = "listRoutes" }
+    $publicRoute = @(
+        $routeList.data.routes |
+            Where-Object {
+                $_.DomainType -eq "HTTPSERVICE" -and
+                $_.Path -eq $RoutePath -and
+                $_.UpstreamResourceName -eq $FunctionName
+            }
+    ) | Select-Object -First 1
+    if (-not $publicRoute) {
+        throw "The HTTP gateway route was not visible after deployment"
+    }
+    $publicBaseUrl = "https://$($publicRoute.Domain)$RoutePath"
+    Write-Host "Public API base URL: $publicBaseUrl"
+
     if (-not $SkipSmokeTest) {
-        $url = "https://$envId.api.tcloudbasegateway.com/v1/functions/$FunctionName`?webfn=true"
-        $response = Invoke-WebRequest -UseBasicParsing -Uri $url -Method GET `
-            -Headers @{ Authorization = "Bearer $apiKey" } -TimeoutSec 90
+        $url = "$publicBaseUrl/projects/?limit=1"
+        $response = Invoke-WebRequest -UseBasicParsing -Uri $url -Method GET -TimeoutSec 90
         if ($response.StatusCode -ne 200) {
             throw "Production smoke test returned HTTP $($response.StatusCode)"
         }
         $payload = $response.Content | ConvertFrom-Json
-        if ($payload.message -ne "Django API is running") {
+        if (-not $payload.ok) {
             throw "Production smoke test returned an unexpected response"
         }
         Write-Host "Smoke test passed: $url"

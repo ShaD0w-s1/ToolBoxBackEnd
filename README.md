@@ -121,7 +121,8 @@ Git 仓库只保存无密钥的代码和配置模板；API Key、微信密钥等
 2. 检查 CloudBase MCP 登录环境；
 3. 创建或更新 Python 3.10 HTTP 函数；
 4. 合并云端环境变量并设置 60 秒超时；
-5. 等待函数进入 `Active/Available`；
-6. 使用服务端 API Key 执行线上冒烟测试。
+5. 创建或校验公开的 `/api` HTTP 网关路由；
+6. 等待函数进入 `Active/Available`；
+7. 通过线上 `/api/projects/` 读取 CloudBase NoSQL，完成冒烟测试。
 
-首次运行会在被 Git 忽略的 `.env` 中生成稳定的 `DJANGO_PRODUCTION_SECRET_KEY`，后续部署不会使现有 Django 会话失效。
+首次正式部署会在被 Git 忽略的 `.env` 中生成稳定的 `DJANGO_PRODUCTION_SECRET_KEY`，后续部署不会使现有 Django 会话失效。
