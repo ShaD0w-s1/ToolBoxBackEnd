@@ -375,6 +375,7 @@ try {
     }
     $isLegacyRoute = (
         # 仅允许已知旧名称平滑迁移；其他占用 /api 的服务仍然拒绝覆盖。
+        [bool]$pathRoute -and
         $FunctionName -eq "toolbox-api" -and
         $pathRoute.UpstreamResourceName -eq "dtlapi"
     )
