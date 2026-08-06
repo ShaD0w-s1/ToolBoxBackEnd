@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from django.http import HttpRequest, JsonResponse
+from django.middleware.csrf import get_token
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_http_methods
 
@@ -77,7 +78,7 @@ def index(request):
 @ensure_csrf_cookie
 @require_http_methods(["GET"])
 def csrf(request):
-    return JsonResponse({"ok": True})
+    return JsonResponse({"ok": True, "csrf_token": get_token(request)})
 
 
 @require_http_methods(["GET"])

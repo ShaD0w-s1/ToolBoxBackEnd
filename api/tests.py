@@ -44,6 +44,12 @@ class ApiSmokeTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertNotIn("api_key", response.json())
 
+    def test_csrf_returns_a_token_for_cross_origin_clients(self):
+        response = self.client.get("/api/csrf/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["csrf_token"])
+
     def test_create_project_maps_business_document(self):
         fake = FakeNoSQLClient()
         payload = {
