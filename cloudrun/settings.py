@@ -1,7 +1,7 @@
-"""Settings for local development only.
+"""仅供本地开发使用的 Django 设置。
 
-CloudBase continues to use ``cloudrun.settings_scf``. Keeping this module
-separate prevents local SQLite/debug settings from leaking into deployment.
+CloudBase 始终显式使用 ``cloudrun.settings_scf``。两套设置分离，可以防止
+本地 SQLite、调试模式和开发跨域配置意外进入生产环境。
 """
 
 from dotenv import load_dotenv
@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from .settings_scf import *  # noqa: F403
 
 
+# .env 被 Git 忽略，只在本地加载；云端配置来自函数环境变量。
 load_dotenv(BASE_DIR / ".env")  # noqa: F405
 
 
@@ -17,6 +18,7 @@ SECRET_KEY = "django-local-development-only"
 ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
 
 DATABASES = {
+    # SQLite 仅供 Django 框架自身使用，不存放项目、模板或工具车业务数据。
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": BASE_DIR / "db.sqlite3",  # noqa: F405

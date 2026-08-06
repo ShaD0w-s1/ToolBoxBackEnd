@@ -3,7 +3,7 @@
   "functionRoot": "./",
   "functions": [
     {
-      "name": "dtlapi",
+      "name": "toolbox-api",
       "type": "HTTP",
       "runtime": "Python3.10",
       "timeout": 60,

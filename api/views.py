@@ -1,3 +1,9 @@
+"""ToolBox 的 HTTP API 视图。
+
+视图只处理输入校验和响应映射；CloudBase 协议细节集中在 cloudbase_nosql，
+轮询修订计算集中在 polling，避免业务入口承担过多职责。
+"""
+
 import json
 import os
 from datetime import datetime, timezone
@@ -12,8 +18,10 @@ from .cloudbase_nosql import (
     CloudBaseConfigError,
     CloudBaseNoSQLClient,
 )
+from .polling import PollingPayloadError, calculate_revision
 
 
+# 本地开发可通过前缀使用独立测试集合；生产环境保持空前缀。
 COLLECTION_PREFIX = os.getenv("CLOUDBASE_COLLECTION_PREFIX", "")
 PROJECTS = f"{COLLECTION_PREFIX}work_projects"
 TEMPLATES = f"{COLLECTION_PREFIX}aircraft_templates"
@@ -43,6 +51,7 @@ def _error(message: str, status: int, details=None) -> JsonResponse:
 
 
 def _handle_cloudbase_error(exc: Exception) -> JsonResponse:
+    """把基础设施异常转换成稳定的 HTTP 错误响应。"""
     if isinstance(exc, CloudBaseConfigError):
         return _error(str(exc), 503)
     if isinstance(exc, CloudBaseAPIError):
@@ -73,6 +82,7 @@ def csrf(request):
 
 @require_http_methods(["GET"])
 def cloudbase_status(request):
+    # 只返回是否完成配置，绝不把 API Key 内容发送给客户端。
     api_key = os.getenv("CLOUDBASE_API_KEY", "")
     return JsonResponse(
         {
@@ -82,6 +92,35 @@ def cloudbase_status(request):
             "collections": [PROJECTS, TEMPLATES, TOOL_CART],
         }
     )
+
+
+@require_http_methods(["GET"])
+def poll(request):
+    """返回所有用户可见业务数据的稳定修订值。"""
+    try:
+        revision = calculate_revision(
+            get_nosql_client(),
+            (PROJECTS, TEMPLATES, TOOL_CART),
+        )
+        # 首次不带 revision 只建立基线；之后仅在值不同时报告 changed。
+        previous = request.GET.get("revision", "").strip().strip('"')
+        response = JsonResponse(
+            {
+                "ok": True,
+                "revision": revision,
+                "changed": bool(previous and previous != revision),
+                "poll_after_ms": 5000,
+            }
+        )
+        # 禁止中间缓存复用旧结果；ETag 供支持条件请求的客户端扩展使用。
+        response["ETag"] = f'"{revision}"'
+        response["Cache-Control"] = "no-store"
+        return response
+    except (CloudBaseConfigError, CloudBaseAPIError) as exc:
+        return _handle_cloudbase_error(exc)
+    except PollingPayloadError as exc:
+        # 上游返回未知结构时必须明确失败，不能把它误判成“集合为空”。
+        return _error(str(exc), 502)
 
 
 @require_http_methods(["GET", "POST"])
@@ -113,6 +152,7 @@ def projects(request):
 
         now = _now()
         document = {
+            # 客户端生成 ID 会让失败重试更复杂，因此由可信后端统一生成。
             "_id": uuid4().hex,
             "name": name,
             "aircraft_type": aircraft_type,
@@ -167,6 +207,7 @@ def project_detail(request, project_id):
         result = client.update_document(
             PROJECTS,
             project_id,
+            # version 每次写入都原子递增，供后续冲突检测和审计使用。
             {"$set": updates, "$inc": {"version": 1}},
         )
         return JsonResponse({"ok": True, "result": result})
@@ -201,6 +242,7 @@ def aircraft_template(request, aircraft_type):
                     "updated_at": _now(),
                 }
             },
+            # 标准库首次保存时可能尚不存在，因此允许原子创建或更新。
             upsert=True,
         )
         return JsonResponse({"ok": True, "result": result})
@@ -226,6 +268,7 @@ def tool_cart(request):
             TOOL_CART,
             "default",
             {"$set": {"items": items, "updated_at": _now()}},
+            # 工具车使用固定文档 ID，首次保存时允许直接创建。
             upsert=True,
         )
         return JsonResponse({"ok": True, "result": result})

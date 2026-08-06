@@ -1,6 +1,6 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
-    [string]$FunctionName = "dtlapi",
+    [string]$FunctionName = "toolbox-api",
     [string]$SourceRef = "main",
     [string]$RoutePath = "/api",
     [switch]$Deploy,
@@ -10,17 +10,20 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# 所有临时文件都放在带固定前缀的系统临时目录中；清理前还会再次校验路径，
+# 防止变量异常时误删仓库或其他目录。
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $manifestPath = Join-Path $repoRoot "deploy\production-files.txt"
 $envPath = Join-Path $repoRoot ".env"
 $tempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
-$stageRoot = Join-Path $tempBase ("dtl-prod-" + [Guid]::NewGuid().ToString("N"))
+$stageRoot = Join-Path $tempBase ("toolbox-prod-" + [Guid]::NewGuid().ToString("N"))
 $functionDir = Join-Path $stageRoot $FunctionName
 $archivePath = Join-Path $stageRoot "source.zip"
 $script:mcpProcess = $null
 $script:mcpRequestId = 10
 
 function Read-DotEnv([string]$Path) {
+    # 这里只读取部署必需的简单 KEY=VALUE，不执行 .env 中的任何代码。
     $values = @{}
     if (-not (Test-Path -LiteralPath $Path)) {
         return $values
@@ -42,6 +45,7 @@ function Read-DotEnv([string]$Path) {
 }
 
 function New-ProductionSecret {
+    # 首次部署生成高熵密钥并保存到被 Git 忽略的 .env，后续部署保持不变。
     $bytes = New-Object byte[] 48
     $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
     try {
@@ -54,6 +58,7 @@ function New-ProductionSecret {
 }
 
 function Get-CloudBaseMcpCli {
+    # 优先使用显式路径，否则从 npx 缓存中选择最近使用的 CloudBase MCP。
     if ($env:CLOUDBASE_MCP_CLI -and (Test-Path -LiteralPath $env:CLOUDBASE_MCP_CLI)) {
         return [IO.Path]::GetFullPath($env:CLOUDBASE_MCP_CLI)
     }
@@ -73,6 +78,7 @@ function Get-CloudBaseMcpCli {
 }
 
 function Start-Mcp([string]$CliPath) {
+    # MCP 使用标准输入输出上的 JSON-RPC；不经过交互式 Shell，避免参数注入。
     $node = (Get-Command node.exe -ErrorAction Stop).Source
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $node
@@ -95,7 +101,7 @@ function Start-Mcp([string]$CliPath) {
         params = @{
             protocolVersion = "2024-11-05"
             capabilities = @{}
-            clientInfo = @{ name = "dtl-production-deploy"; version = "1.0" }
+            clientInfo = @{ name = "toolbox-production-deploy"; version = "1.0" }
         }
     } | ConvertTo-Json -Compress -Depth 10
     $script:mcpProcess.StandardInput.WriteLine($initialize)
@@ -112,6 +118,7 @@ function Start-Mcp([string]$CliPath) {
 }
 
 function Invoke-McpTool([string]$Name, [hashtable]$Arguments) {
+    # 每次调用使用递增请求 ID，并要求返回第一段文本是可解析 JSON。
     $script:mcpRequestId++
     $request = @{
         jsonrpc = "2.0"
@@ -141,13 +148,14 @@ function Remove-StageDirectory {
     }
     $resolved = [IO.Path]::GetFullPath($stageRoot)
     $leaf = [IO.Path]::GetFileName($resolved)
-    if (-not $resolved.StartsWith($tempBase) -or -not $leaf.StartsWith("dtl-prod-")) {
+    if (-not $resolved.StartsWith($tempBase) -or -not $leaf.StartsWith("toolbox-prod-")) {
         throw "Refusing to remove unexpected staging path: $resolved"
     }
     Remove-Item -LiteralPath $resolved -Recurse -Force
 }
 
 function Build-ProductionPackage {
+    # 生产包只从指定 Git 引用读取白名单文件，不直接打包工作区中的未提交内容。
     if (-not (Test-Path -LiteralPath $manifestPath)) {
         throw "Production manifest not found: $manifestPath"
     }
@@ -199,6 +207,7 @@ function Build-ProductionPackage {
 
 Push-Location $repoRoot
 try {
+    # 第一阶段只做确定性打包和配置检查；未指定 -Deploy 时不会修改云资源。
     if (-not $RoutePath.StartsWith("/")) {
         throw "RoutePath must start with /"
     }
@@ -264,6 +273,7 @@ try {
     }
 
     if ($existing) {
+        # 更新配置时保留脚本不认识的既有环境变量，避免误删人工配置。
         $detail = Invoke-McpTool "queryFunctions" @{
             action = "getFunctionDetail"
             functionName = $FunctionName
@@ -318,6 +328,7 @@ try {
     }
 
     $ready = $false
+    # CloudBase 更新代码后需要异步发布，必须确认实例可用再切换网关。
     for ($attempt = 1; $attempt -le 30; $attempt++) {
         $detail = Invoke-McpTool "queryFunctions" @{
             action = "getFunctionDetail"
@@ -362,7 +373,12 @@ try {
     if ($pathRoute.Count -gt 1) {
         throw "Multiple HTTP gateway routes already use $RoutePath"
     }
-    if ($pathRoute -and $pathRoute.UpstreamResourceName -ne $FunctionName) {
+    $isLegacyRoute = (
+        # 仅允许已知旧名称平滑迁移；其他占用 /api 的服务仍然拒绝覆盖。
+        $FunctionName -eq "toolbox-api" -and
+        $pathRoute.UpstreamResourceName -eq "dtlapi"
+    )
+    if ($pathRoute -and $pathRoute.UpstreamResourceName -ne $FunctionName -and -not $isLegacyRoute) {
         throw "HTTP gateway route $RoutePath already targets $($pathRoute.UpstreamResourceName)"
     }
 
@@ -381,6 +397,7 @@ try {
         Write-Host "Created public HTTP gateway route $RoutePath."
     }
     elseif (
+        $pathRoute.UpstreamResourceName -ne $FunctionName -or
         $pathRoute.UpstreamResourceType -ne "WEB_SCF" -or
         $pathRoute.EnableAuth -or
         -not $pathRoute.EnablePathTransmission
@@ -416,6 +433,7 @@ try {
     Write-Host "Public API base URL: $publicBaseUrl"
 
     if (-not $SkipSmokeTest) {
+        # 最终通过公开网关读取真实 NoSQL，覆盖函数、路由和凭据整条链路。
         $url = "$publicBaseUrl/projects/?limit=1"
         $response = Invoke-WebRequest -UseBasicParsing -Uri $url -Method GET -TimeoutSec 90
         if ($response.StatusCode -ne 200) {

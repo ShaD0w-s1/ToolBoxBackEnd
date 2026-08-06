@@ -4,6 +4,7 @@ from unittest.mock import patch
 from django.test import TestCase
 
 from .cloudbase_nosql import decode_ejson
+from .polling import PollingPayloadError, calculate_revision
 
 
 class FakeNoSQLClient:
@@ -89,3 +90,65 @@ class EJsonTests(TestCase):
             decode_ejson(value),
             {"_id": "abc", "quantity": 2, "nested": [{"version": 3}]},
         )
+
+
+class PollingTests(TestCase):
+    def test_unknown_cloudbase_payload_is_rejected(self):
+        fake = FakeNoSQLClient()
+        fake.list_documents = lambda collection, **kwargs: {"unexpected": []}
+
+        with self.assertRaises(PollingPayloadError):
+            calculate_revision(fake, ["projects"])
+
+    def test_non_document_list_item_is_rejected(self):
+        fake = FakeNoSQLClient()
+        fake.list_documents = lambda collection, **kwargs: {
+            "data": [{"_id": "valid"}, "invalid"]
+        }
+
+        with self.assertRaisesRegex(PollingPayloadError, "第 1 项不是对象"):
+            calculate_revision(fake, ["projects"])
+
+    def test_poll_returns_bad_gateway_for_unknown_payload(self):
+        fake = FakeNoSQLClient()
+        fake.list_documents = lambda collection, **kwargs: {"unexpected": []}
+
+        with patch("api.views.get_nosql_client", return_value=fake):
+            response = self.client.get("/api/poll/")
+
+        self.assertEqual(response.status_code, 502)
+        self.assertFalse(response.json()["ok"])
+
+    def test_revision_is_stable_when_document_order_changes(self):
+        fake = FakeNoSQLClient()
+        fake.list_documents = lambda collection, **kwargs: {
+            "data": [
+                {"_id": "b", "version": 2},
+                {"_id": "a", "version": 1},
+            ]
+        }
+        first = calculate_revision(fake, ["projects"])
+        fake.list_documents = lambda collection, **kwargs: {
+            "data": [
+                {"_id": "a", "version": 1},
+                {"_id": "b", "version": 2},
+            ]
+        }
+
+        self.assertEqual(calculate_revision(fake, ["projects"]), first)
+
+    def test_poll_reports_a_changed_revision(self):
+        fake = FakeNoSQLClient()
+        fake.list_documents = lambda collection, **kwargs: {
+            "data": [{"_id": collection, "version": 1}]
+        }
+        with patch("api.views.get_nosql_client", return_value=fake):
+            baseline = self.client.get("/api/poll/").json()["revision"]
+            fake.list_documents = lambda collection, **kwargs: {
+                "data": [{"_id": collection, "version": 2}]
+            }
+            response = self.client.get(f"/api/poll/?revision={baseline}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["changed"])
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
