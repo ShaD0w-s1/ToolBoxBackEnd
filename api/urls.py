@@ -1,3 +1,5 @@
+"""业务 API 路由表；所有公开接口统一保留在 /api 前缀下。"""
+
 from django.urls import path
 
 from . import views
@@ -6,6 +8,7 @@ urlpatterns = [
     path("", views.index),
     path("api/csrf/", views.csrf),
     path("api/cloudbase/status/", views.cloudbase_status),
+    path("api/poll/", views.poll),
     path("api/projects/", views.projects),
     path("api/projects/<str:project_id>/", views.project_detail),
     path("api/templates/<str:aircraft_type>/", views.aircraft_template),

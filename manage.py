@@ -1,11 +1,11 @@
 #!/usr/bin/env python
-"""Django's command-line utility for administrative tasks."""
+"""Django 管理命令入口。"""
 import os
 import sys
 
 def main():
-    # Local development is the safe default. CloudBase explicitly selects
-    # cloudrun.settings_scf from scf_bootstrap and cloudrun/wsgi.py.
+    # 默认使用安全的本地开发设置；CloudBase 会由 scf_bootstrap 和 WSGI
+    # 入口显式选择 cloudrun.settings_scf。
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", "cloudrun.settings")
     from django.core.management import execute_from_command_line
     execute_from_command_line(sys.argv)

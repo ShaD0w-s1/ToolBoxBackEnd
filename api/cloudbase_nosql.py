@@ -1,8 +1,8 @@
-"""Small CloudBase NoSQL HTTP client used by the Django API.
+"""Django API 使用的轻量 CloudBase NoSQL HTTP 客户端。
 
-CloudBase's document database is not a Django ORM backend. Keeping it behind
-this adapter avoids coupling views to HTTP details and leaves Django's SQLite
-database available for sessions and authentication.
+CloudBase 文档数据库不是 Django ORM 后端。把 HTTP 调用集中封装在这一层，
+可以避免视图直接依赖 CloudBase 的请求格式，同时保留 Django 自带 SQLite，
+供本地会话、认证和迁移等框架功能使用。
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ class CloudBaseAPIError(RuntimeError):
 
 
 def decode_ejson(value: Any) -> Any:
-    """Convert common Strict EJSON wrappers into JSON-friendly values."""
+    """把 CloudBase 返回的常见 Strict EJSON 包装转换成普通 JSON 值。"""
     if isinstance(value, list):
         return [decode_ejson(item) for item in value]
     if not isinstance(value, dict):
@@ -70,6 +70,7 @@ class CloudBaseNoSQLClient:
         if not self.api_key or self.api_key.startswith("replace-"):
             raise CloudBaseConfigError("CLOUDBASE_API_KEY is not configured")
 
+        # API Key 只存在后端环境变量中。前端永远不应直接访问这个网关地址。
         self.base_url = (
             f"https://{self.env_id}.api.tcloudbasegateway.com/v1/database/"
             f"instances/{quote(self.instance, safe='()')}/"
@@ -86,6 +87,7 @@ class CloudBaseNoSQLClient:
     ) -> Any:
         url = f"{self.base_url}{path}"
         if query:
+            # CloudBase HTTP API 要求对象和数组查询参数先编码为紧凑 JSON。
             encoded = {
                 key: json.dumps(value, ensure_ascii=False, separators=(",", ":"))
                 if isinstance(value, (dict, list))
@@ -114,6 +116,7 @@ class CloudBaseNoSQLClient:
             with urlopen(request, timeout=self.timeout) as response:
                 payload = response.read()
         except HTTPError as exc:
+            # 尽量保留云端原始错误详情，便于无人值守时从日志定位问题。
             raw = exc.read().decode("utf-8", errors="replace")
             try:
                 details = json.loads(raw)

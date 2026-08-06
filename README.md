@@ -40,6 +40,7 @@ CLOUDBASE_NOSQL_DATABASE=(default)
 
 ```text
 GET                  /api/cloudbase/status/
+GET                  /api/poll/
 GET, POST            /api/projects/
 GET, PATCH, DELETE   /api/projects/<project_id>/
 GET, PUT             /api/templates/A320/
@@ -47,6 +48,11 @@ GET, PUT             /api/templates/B787/
 GET, PUT             /api/tool-cart/
 GET                  /api/csrf/
 ```
+
+`GET /api/poll/` 用于客户端的 5 秒变更探测。首次请求不带参数取得
+`revision`，后续通过 `?revision=<revision>` 轮询；`changed=true` 时客户端再
+重新读取业务数据。修订值直接从三个业务集合的完整当前状态计算，不依赖云
+函数内存或额外通知记录，因此实例冷启动、重建以及文档删除都不会漏报。
 
 浏览器执行写操作前，应先请求 `/api/csrf/`，随后将 `csrftoken` Cookie 的值通过 `X-CSRFToken` 请求头传回。
 
@@ -109,11 +115,14 @@ Git 仓库只保存无密钥的代码和配置模板；API Key、微信密钥等
 .\scripts\deploy-production.ps1
 ```
 
-确认预检输出后部署到普通 HTTP 云函数 `dtlapi`：
+确认预检输出后部署到普通 HTTP 云函数 `toolbox-api`：
 
 ```powershell
 .\scripts\deploy-production.ps1 -Deploy
 ```
+
+首次使用新名称部署时，脚本允许把原来指向 `dtlapi` 的 `/api` 路由切换到
+`toolbox-api`。旧函数会保留作为人工回退点，不会被部署脚本自动删除。
 
 脚本会自动完成：
 
@@ -121,7 +130,8 @@ Git 仓库只保存无密钥的代码和配置模板；API Key、微信密钥等
 2. 检查 CloudBase MCP 登录环境；
 3. 创建或更新 Python 3.10 HTTP 函数；
 4. 合并云端环境变量并设置 60 秒超时；
-5. 等待函数进入 `Active/Available`；
-6. 使用服务端 API Key 执行线上冒烟测试。
+5. 创建或校验公开的 `/api` HTTP 网关路由；
+6. 等待函数进入 `Active/Available`；
+7. 通过线上 `/api/projects/` 读取 CloudBase NoSQL，完成冒烟测试。
 
-首次运行会在被 Git 忽略的 `.env` 中生成稳定的 `DJANGO_PRODUCTION_SECRET_KEY`，后续部署不会使现有 Django 会话失效。
+首次正式部署会在被 Git 忽略的 `.env` 中生成稳定的 `DJANGO_PRODUCTION_SECRET_KEY`，后续部署不会使现有 Django 会话失效。
