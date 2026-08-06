@@ -14,9 +14,10 @@ from .cloudbase_nosql import (
 )
 
 
-PROJECTS = "work_projects"
-TEMPLATES = "aircraft_templates"
-TOOL_CART = "tool_cart"
+COLLECTION_PREFIX = os.getenv("CLOUDBASE_COLLECTION_PREFIX", "")
+PROJECTS = f"{COLLECTION_PREFIX}work_projects"
+TEMPLATES = f"{COLLECTION_PREFIX}aircraft_templates"
+TOOL_CART = f"{COLLECTION_PREFIX}tool_cart"
 AIRCRAFT_TYPES = {"A320", "B787"}
 
 
