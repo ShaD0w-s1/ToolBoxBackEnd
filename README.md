@@ -83,3 +83,18 @@ python manage.py test
 ```
 
 CloudBase 部署显式使用 `cloudrun.settings_scf`；本地运行默认使用 `cloudrun.settings`。
+
+## Git 与环境分离
+
+- `main`：生产分支，只有该分支允许触发 CloudBase 部署。
+- `develop`：日常开发与本地验证分支，不直接部署生产环境。
+- `.env`：本地配置，不进入 Git。
+- CloudBase 函数环境变量：生产配置，保存在云端，不进入 Git。
+
+发布流程：
+
+```text
+develop 开发与测试 → 合并到 main → 推送 main → 部署 CloudBase
+```
+
+Git 仓库只保存无密钥的代码和配置模板；API Key、微信密钥等始终通过本地或云端环境变量管理。

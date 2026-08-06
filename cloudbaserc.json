@@ -3,7 +3,7 @@
   "functionRoot": "./",
   "functions": [
     {
-      "name": "http-python-django",
+      "name": "httppythondjango",
       "type": "HTTP",
       "runtime": "Python3.10",
       "timeout": 60,
