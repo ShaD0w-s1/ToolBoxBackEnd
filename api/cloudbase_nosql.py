@@ -148,7 +148,7 @@ class CloudBaseNoSQLClient:
         limit: int = 20,
         order: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
-        return self._request(
+        payload = self._request(
             "GET",
             self._collection_path(collection),
             query={
@@ -158,6 +158,15 @@ class CloudBaseNoSQLClient:
                 "order": order,
             },
         )
+        # CloudBase list responses have used several envelope keys over time.
+        # Keep the original pagination metadata and expose one stable field to
+        # the Django API and browser clients.
+        if isinstance(payload, dict) and "data" not in payload:
+            for key in ("list", "documents", "items"):
+                if isinstance(payload.get(key), list):
+                    payload = {**payload, "data": payload[key]}
+                    break
+        return payload
 
     def insert_document(self, collection: str, document: dict[str, Any]) -> Any:
         return self._request(

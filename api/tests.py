@@ -83,6 +83,20 @@ class ApiSmokeTests(TestCase):
         self.assertEqual(document["sections"][0]["tasks"][0]["items"][0]["quantity"], 2)
         self.assertEqual(document["version"], 1)
 
+    def test_project_list_exposes_stable_data_field(self):
+        fake = FakeNoSQLClient()
+        fake.list_documents = lambda collection, **kwargs: {
+            "offset": 0,
+            "limit": kwargs["limit"],
+            "list": [{"_id": "project-1", "name": "Persisted"}],
+        }
+
+        with patch("api.views.get_nosql_client", return_value=fake):
+            response = self.client.get("/api/projects/?limit=100")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"][0]["_id"], "project-1")
+
 
 class NinjaApiTests(TestCase):
     def test_swagger_docs_page_renders(self):

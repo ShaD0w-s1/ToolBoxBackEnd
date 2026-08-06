@@ -141,6 +141,11 @@ def projects(request):
                 offset=offset,
                 order=[{"field": "created_at", "direction": "desc"}],
             )
+            if isinstance(result, dict) and not isinstance(result.get("data"), list):
+                for key in ("list", "documents", "items"):
+                    if isinstance(result.get(key), list):
+                        result = {**result, "data": result[key]}
+                        break
             return JsonResponse({"ok": True, **result})
 
         body = _json_body(request)
