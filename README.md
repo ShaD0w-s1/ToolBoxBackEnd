@@ -98,3 +98,30 @@ develop 开发与测试 → 合并到 main → 推送 main → 部署 CloudBase
 ```
 
 Git 仓库只保存无密钥的代码和配置模板；API Key、微信密钥等始终通过本地或云端环境变量管理。
+
+## 生产部署脚本
+
+生产部署只读取 `main` 中由 `deploy/production-files.txt` 明确列出的运行文件。它不会上传 `.env`、SQLite、测试、本地设置、文档或虚拟环境。
+
+先执行只读预检：
+
+```powershell
+.\scripts\deploy-production.ps1
+```
+
+确认预检输出后部署到普通 HTTP 云函数 `dtlapi`：
+
+```powershell
+.\scripts\deploy-production.ps1 -Deploy
+```
+
+脚本会自动完成：
+
+1. 从 `main` 生成确定性的生产包；
+2. 检查 CloudBase MCP 登录环境；
+3. 创建或更新 Python 3.10 HTTP 函数；
+4. 合并云端环境变量并设置 60 秒超时；
+5. 等待函数进入 `Active/Available`；
+6. 使用服务端 API Key 执行线上冒烟测试。
+
+首次运行会在被 Git 忽略的 `.env` 中生成稳定的 `DJANGO_PRODUCTION_SECRET_KEY`，后续部署不会使现有 Django 会话失效。

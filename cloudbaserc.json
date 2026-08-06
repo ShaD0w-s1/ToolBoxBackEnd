@@ -3,7 +3,7 @@
   "functionRoot": "./",
   "functions": [
     {
-      "name": "httppythondjango",
+      "name": "dtlapi",
       "type": "HTTP",
       "runtime": "Python3.10",
       "timeout": 60,
