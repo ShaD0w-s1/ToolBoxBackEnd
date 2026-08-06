@@ -1,0 +1,14 @@
+{
+  "envId": "da-tool-list-d2g0awsejc0658949",
+  "functionRoot": "./",
+  "functions": [
+    {
+      "name": "http-python-django",
+      "type": "HTTP",
+      "runtime": "Python3.10",
+      "timeout": 60,
+      "memorySize": 512,
+      "installDependency": true
+    }
+  ]
+}
