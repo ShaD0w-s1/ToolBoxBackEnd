@@ -203,6 +203,27 @@ function Build-ProductionPackage {
     Write-Host "Production files:"
     Get-ChildItem -LiteralPath $functionDir -Recurse -File |
         ForEach-Object { Write-Host ("  " + $_.FullName.Substring($functionDir.Length + 1)) }
+
+    # CloudBase's HTTP-function updater does not reliably install Python
+    # requirements, so vendor Linux CPython 3.10 wheels into the upload.
+    $deploymentPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
+    if (-not (Test-Path -LiteralPath $deploymentPython -PathType Leaf)) {
+        $deploymentPython = (Get-Command python.exe -ErrorAction Stop).Source
+    }
+    Write-Host "Vendoring Python 3.10 Linux dependencies..."
+    & $deploymentPython -m pip install `
+        --disable-pip-version-check `
+        --no-compile `
+        --platform manylinux2014_x86_64 `
+        --implementation cp `
+        --python-version 3.10 `
+        --abi cp310 `
+        --only-binary=:all: `
+        --target $functionDir `
+        --requirement (Join-Path $functionDir "requirements.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to vendor production Python dependencies"
+    }
 }
 
 Push-Location $repoRoot
