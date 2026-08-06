@@ -290,7 +290,7 @@ try {
         CLOUDBASE_API_KEY = $apiKey
         CLOUDBASE_NOSQL_INSTANCE = "(default)"
         CLOUDBASE_NOSQL_DATABASE = "(default)"
-        CORS_ALLOWED_ORIGINS = "https://fe-da-tool-list-d2g0awsejc0658949.webapps.tcloudbase.com,https://da-tool-list-d2g0awsejc0658949-1464163374.tcloudbaseapp.com"
+        CSRF_TRUSTED_ORIGINS = "https://fe-da-tool-list-d2g0awsejc0658949.webapps.tcloudbase.com,https://da-tool-list-d2g0awsejc0658949-1464163374.tcloudbaseapp.com"
         PYTHONUNBUFFERED = "1"
     }
 

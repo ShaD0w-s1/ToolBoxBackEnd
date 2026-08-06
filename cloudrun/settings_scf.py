@@ -13,18 +13,13 @@ ALLOWED_HOSTS = ["*"]
 ROOT_URLCONF = "cloudrun.urls"
 WSGI_APPLICATION = "cloudrun.wsgi.application"
 # 生产 API 不依赖 Django ORM、管理后台或本地会话，减少启动面和故障面。
-CORS_ALLOWED_ORIGINS = [
+CSRF_TRUSTED_ORIGINS = [
     origin.strip()
-    for origin in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",")
+    for origin in os.environ.get("CSRF_TRUSTED_ORIGINS", "").split(",")
     if origin.strip()
 ]
-CORS_ALLOW_CREDENTIALS = True
-CSRF_TRUSTED_ORIGINS = CORS_ALLOWED_ORIGINS
-INSTALLED_APPS = ["corsheaders", "api"]
-MIDDLEWARE = [
-    "corsheaders.middleware.CorsMiddleware",
-    "django.middleware.common.CommonMiddleware",
-]
+INSTALLED_APPS = ["api"]
+MIDDLEWARE = ["django.middleware.common.CommonMiddleware"]
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
