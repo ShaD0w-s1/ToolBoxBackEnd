@@ -78,6 +78,48 @@ class ApiSmokeTests(TestCase):
         self.assertEqual(document["version"], 1)
 
 
+class NinjaApiTests(TestCase):
+    def test_swagger_docs_page_renders(self):
+        response = self.client.get("/api/docs")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "swagger-ui")
+
+    def test_openapi_schema_describes_typed_examples(self):
+        response = self.client.get("/api/openapi.json")
+
+        self.assertEqual(response.status_code, 200)
+        paths = response.json()["paths"]
+        self.assertIn("/api/hello", paths)
+        self.assertIn("/api/project-preview", paths)
+
+    def test_project_preview_validates_and_returns_payload(self):
+        response = self.client.post(
+            "/api/project-preview",
+            data=json.dumps(
+                {
+                    "name": "A320 Check",
+                    "aircraft_type": "A320",
+                    "team": "A1",
+                }
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["ok"])
+        self.assertEqual(response.json()["data"]["aircraft_type"], "A320")
+
+    def test_project_preview_rejects_unknown_aircraft_type(self):
+        response = self.client.post(
+            "/api/project-preview",
+            data=json.dumps({"name": "Demo", "aircraft_type": "C919"}),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 422)
+
+
 class EJsonTests(TestCase):
     def test_decodes_cloudbase_strict_ejson(self):
         value = {

@@ -15,6 +15,13 @@ WSGI_APPLICATION = "cloudrun.wsgi.application"
 # 生产 API 不依赖 Django ORM、管理后台或本地会话，减少启动面和故障面。
 INSTALLED_APPS = ["api"]
 MIDDLEWARE = ["django.middleware.common.CommonMiddleware"]
+TEMPLATES = [
+    {
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "APP_DIRS": True,
+        "OPTIONS": {},
+    }
+]
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 USE_TZ = True
 LANGUAGE_CODE = "zh-hans"
