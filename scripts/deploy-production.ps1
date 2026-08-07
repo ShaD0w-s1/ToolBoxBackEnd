@@ -44,6 +44,15 @@ function Read-DotEnv([string]$Path) {
     return $values
 }
 
+function Get-ConfigurationValue([hashtable]$Configuration, [string]$Name) {
+    # GitHub Actions 等 CI 环境直接注入变量；本地部署继续读取被忽略的 .env。
+    $environmentValue = [Environment]::GetEnvironmentVariable($Name)
+    if ($environmentValue) {
+        return $environmentValue
+    }
+    return $Configuration[$Name]
+}
+
 function New-ProductionSecret {
     # 首次部署生成高熵密钥并保存到被 Git 忽略的 .env，后续部署保持不变。
     $bytes = New-Object byte[] 48
@@ -239,13 +248,13 @@ try {
     Build-ProductionPackage
 
     $configuration = Read-DotEnv $envPath
-    $envId = $configuration["CLOUDBASE_ENV_ID"]
-    $apiKey = $configuration["CLOUDBASE_API_KEY"]
+    $envId = Get-ConfigurationValue $configuration "CLOUDBASE_ENV_ID"
+    $apiKey = Get-ConfigurationValue $configuration "CLOUDBASE_API_KEY"
     if (-not $envId) {
-        throw "CLOUDBASE_ENV_ID is missing from .env"
+        throw "CLOUDBASE_ENV_ID is missing from the environment and .env"
     }
     if (-not $apiKey -or $apiKey.StartsWith("replace-")) {
-        throw "CLOUDBASE_API_KEY is missing from .env"
+        throw "CLOUDBASE_API_KEY is missing from the environment and .env"
     }
 
     $mcpCli = Get-CloudBaseMcpCli
@@ -277,11 +286,19 @@ try {
         return
     }
 
-    $productionSecret = $configuration["DJANGO_PRODUCTION_SECRET_KEY"]
+    $productionSecret = Get-ConfigurationValue $configuration "DJANGO_PRODUCTION_SECRET_KEY"
     if (-not $productionSecret) {
+        if ($env:CI) {
+            throw "DJANGO_PRODUCTION_SECRET_KEY is required in CI so deployments keep a stable Django secret."
+        }
         $productionSecret = New-ProductionSecret
         Add-Content -LiteralPath $envPath -Value "`nDJANGO_PRODUCTION_SECRET_KEY=$productionSecret"
         Write-Host "Created a stable production Django secret in the ignored .env file."
+    }
+
+    $csrfTrustedOrigins = Get-ConfigurationValue $configuration "CSRF_TRUSTED_ORIGINS"
+    if (-not $csrfTrustedOrigins) {
+        $csrfTrustedOrigins = "https://fe-da-tool-list-d2g0awsejc0658949.webapps.tcloudbase.com,https://da-tool-list-d2g0awsejc0658949-1464163374.tcloudbaseapp.com"
     }
 
     $environment = @{
@@ -290,7 +307,7 @@ try {
         CLOUDBASE_API_KEY = $apiKey
         CLOUDBASE_NOSQL_INSTANCE = "(default)"
         CLOUDBASE_NOSQL_DATABASE = "(default)"
-        CSRF_TRUSTED_ORIGINS = "https://fe-da-tool-list-d2g0awsejc0658949.webapps.tcloudbase.com,https://da-tool-list-d2g0awsejc0658949-1464163374.tcloudbaseapp.com"
+        CSRF_TRUSTED_ORIGINS = $csrfTrustedOrigins
         PYTHONUNBUFFERED = "1"
     }
 
