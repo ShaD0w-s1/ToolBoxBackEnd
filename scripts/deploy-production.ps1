@@ -249,7 +249,12 @@ try {
 
     $configuration = Read-DotEnv $envPath
     $envId = Get-ConfigurationValue $configuration "CLOUDBASE_ENV_ID"
-    $apiKey = Get-ConfigurationValue $configuration "CLOUDBASE_API_KEY"
+    # MCP 会优先使用 CLOUDBASE_API_KEY，导致 CI 中的全权限 CAM 密钥被忽略。
+    # 因此流水线使用独立变量传递应用侧 API Key；本地仍从 .env 读取原名称。
+    $apiKey = [Environment]::GetEnvironmentVariable("TOOLBOX_CLOUDBASE_API_KEY")
+    if (-not $apiKey) {
+        $apiKey = $configuration["CLOUDBASE_API_KEY"]
+    }
     if (-not $envId) {
         throw "CLOUDBASE_ENV_ID is missing from the environment and .env"
     }
