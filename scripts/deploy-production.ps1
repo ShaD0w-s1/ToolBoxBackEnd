@@ -344,17 +344,30 @@ try {
         $codeResult = $null
         # GitHub 托管 Runner 到腾讯云 COS 的跨境上传偶尔会触发 MCP 的 60 秒超时。
         # 每次重试都会重新申请临时上传地址，不复用可能已失效的签名。
-        for ($uploadAttempt = 1; $uploadAttempt -le 3; $uploadAttempt++) {
-            $codeResult = Invoke-McpTool "manageFunctions" @{
-                action = "updateFunctionCode"
-                functionName = $FunctionName
-                functionRootPath = $stageRoot
+        for ($uploadAttempt = 1; $uploadAttempt -le 2; $uploadAttempt++) {
+            try {
+                $codeResult = Invoke-McpTool "manageFunctions" @{
+                    action = "updateFunctionCode"
+                    functionName = $FunctionName
+                    functionRootPath = $stageRoot
+                }
+            }
+            catch {
+                if ($uploadAttempt -ge 2) {
+                    throw
+                }
+                Write-Warning "Function code upload attempt $uploadAttempt terminated the MCP process: $($_.Exception.Message). Retrying..."
+                Stop-Mcp
+                Start-Mcp $mcpCli
+                continue
             }
             if ($codeResult.success) {
                 break
             }
-            if ($uploadAttempt -lt 3) {
+            if ($uploadAttempt -lt 2) {
                 Write-Warning "Function code upload attempt $uploadAttempt failed: $($codeResult.message). Retrying..."
+                Stop-Mcp
+                Start-Mcp $mcpCli
                 Start-Sleep -Seconds 10
             }
         }

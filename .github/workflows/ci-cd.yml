@@ -72,7 +72,18 @@ jobs:
         shell: pwsh
         run: |
           npm install --no-save @cloudbase/cloudbase-mcp@latest
-          "CLOUDBASE_MCP_CLI=$((Resolve-Path 'node_modules/@cloudbase/cloudbase-mcp/dist/cli.cjs').Path)" |
+          $cliPath = (Resolve-Path 'node_modules/@cloudbase/cloudbase-mcp/dist/cli.cjs').Path
+          $source = [IO.File]::ReadAllText($cliPath, [Text.Encoding]::UTF8)
+          $marker = 'COS 上传超时（60秒）'
+          $markerIndex = $source.IndexOf($marker)
+          $timeoutIndex = $source.IndexOf('}, 60000);', $markerIndex)
+          if ($markerIndex -lt 0 -or $timeoutIndex -lt 0) {
+            throw 'Unable to locate the CloudBase MCP COS upload timeout'
+          }
+          $source = $source.Remove($timeoutIndex, 10).Insert($timeoutIndex, '}, 300000);')
+          $source = $source.Replace($marker, 'COS 上传超时（300秒）')
+          [IO.File]::WriteAllText($cliPath, $source, [Text.UTF8Encoding]::new($false))
+          "CLOUDBASE_MCP_CLI=$cliPath" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Deploy and smoke test
