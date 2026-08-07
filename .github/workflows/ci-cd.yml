@@ -73,17 +73,37 @@ jobs:
         run: |
           npm install --no-save @cloudbase/cloudbase-mcp@latest
           $cliPath = (Resolve-Path 'node_modules/@cloudbase/cloudbase-mcp/dist/cli.cjs').Path
-          $runtimePath = (Resolve-Path 'node_modules/@cloudbase/cloudbase-mcp/dist/index.cjs').Path
-          $source = [IO.File]::ReadAllText($runtimePath, [Text.Encoding]::UTF8)
+          $source = [IO.File]::ReadAllText($cliPath, [Text.Encoding]::UTF8)
           $marker = 'COS 上传超时（60秒）'
-          $markerIndex = $source.IndexOf($marker)
-          $timeoutIndex = $source.IndexOf('}, 60000);', $markerIndex)
-          if ($markerIndex -lt 0 -or $timeoutIndex -lt 0) {
+          $timeoutIndexes = @()
+          $searchIndex = 0
+          while (($markerIndex = $source.IndexOf($marker, $searchIndex)) -ge 0) {
+            $candidates = @(
+              @{ Token = '},6e4);'; Replacement = '},3e5);' },
+              @{ Token = '},60000);'; Replacement = '},300000);' },
+              @{ Token = '}, 60000);'; Replacement = '}, 300000);' }
+            ) | ForEach-Object {
+              $index = $source.IndexOf($_.Token, $markerIndex)
+              if ($index -ge 0) {
+                [pscustomobject]@{ Index = $index; Token = $_.Token; Replacement = $_.Replacement }
+              }
+            } | Sort-Object Index
+            $timeout = $candidates | Select-Object -First 1
+            if ($null -eq $timeout -or ($timeout.Index - $markerIndex) -gt 500) {
+              throw 'Found a CloudBase upload timeout message without its timeout value'
+            }
+            $timeoutIndexes += $timeout
+            $searchIndex = $markerIndex + $marker.Length
+          }
+          if ($timeoutIndexes.Count -eq 0) {
             throw 'Unable to locate the CloudBase MCP COS upload timeout'
           }
-          $source = $source.Remove($timeoutIndex, 10).Insert($timeoutIndex, '}, 300000);')
+          foreach ($timeout in @($timeoutIndexes | Sort-Object Index -Descending)) {
+            $source = $source.Remove($timeout.Index, $timeout.Token.Length).Insert($timeout.Index, $timeout.Replacement)
+          }
           $source = $source.Replace($marker, 'COS 上传超时（300秒）')
-          [IO.File]::WriteAllText($runtimePath, $source, [Text.UTF8Encoding]::new($false))
+          [IO.File]::WriteAllText($cliPath, $source, [Text.UTF8Encoding]::new($false))
+          Write-Host "Extended $($timeoutIndexes.Count) CloudBase COS upload timeout(s) to 300 seconds."
           "CLOUDBASE_MCP_CLI=$cliPath" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
