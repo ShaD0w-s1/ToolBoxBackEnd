@@ -341,10 +341,22 @@ try {
         if (-not $configResult.success) {
             throw $configResult.message
         }
-        $codeResult = Invoke-McpTool "manageFunctions" @{
-            action = "updateFunctionCode"
-            functionName = $FunctionName
-            functionRootPath = $stageRoot
+        $codeResult = $null
+        # GitHub 托管 Runner 到腾讯云 COS 的跨境上传偶尔会触发 MCP 的 60 秒超时。
+        # 每次重试都会重新申请临时上传地址，不复用可能已失效的签名。
+        for ($uploadAttempt = 1; $uploadAttempt -le 3; $uploadAttempt++) {
+            $codeResult = Invoke-McpTool "manageFunctions" @{
+                action = "updateFunctionCode"
+                functionName = $FunctionName
+                functionRootPath = $stageRoot
+            }
+            if ($codeResult.success) {
+                break
+            }
+            if ($uploadAttempt -lt 3) {
+                Write-Warning "Function code upload attempt $uploadAttempt failed: $($codeResult.message). Retrying..."
+                Start-Sleep -Seconds 10
+            }
         }
         if (-not $codeResult.success) {
             throw $codeResult.message
