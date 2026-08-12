@@ -26,8 +26,30 @@ from .polling import PollingPayloadError, calculate_revision
 COLLECTION_PREFIX = os.getenv("CLOUDBASE_COLLECTION_PREFIX", "")
 PROJECTS = f"{COLLECTION_PREFIX}work_projects"
 TEMPLATES = f"{COLLECTION_PREFIX}aircraft_templates"
+MATERIAL_TEMPLATES = f"{COLLECTION_PREFIX}aircraft_material_templates"
 TOOL_CART = f"{COLLECTION_PREFIX}tool_cart"
+AIRCRAFT_INFO = f"{COLLECTION_PREFIX}aircraft_info"
+WORKCARD_320 = f"{COLLECTION_PREFIX}workcard_lib_320"
+ANNOUNCEMENT = f"{COLLECTION_PREFIX}announcement"
 AIRCRAFT_TYPES = {"A320", "B787"}
+
+# 工作项目可选类型；空字符串表示历史遗留项目（仅有工具清单）。
+PROJECT_TYPES = {"A检", "零散", "换发", "换APU", "单独项目"}
+
+# 一级页面新增的三类标准库：键 -> (集合名, 文档ID, 行字段顺序)。
+# 标准库以「整文档保存 rows 数组」的方式存储，导入即整体替换，导出即整体读取。
+STANDARD_LIBRARIES = {
+    "aircraft_info": {
+        "collection": AIRCRAFT_INFO,
+        "doc_id": "default",
+        "row_keys": ["飞机号", "MSN", "FSN", "机型", "发动机", "ETOPS", "ELT-DT"],
+    },
+    "workcard_320": {
+        "collection": WORKCARD_320,
+        "doc_id": "default",
+        "row_keys": ["工卡号", "工卡名", "MP项目号", "部位", "分级"],
+    },
+}
 
 
 def _now() -> str:
@@ -81,6 +103,20 @@ def csrf(request):
     return JsonResponse({"ok": True, "csrf_token": get_token(request)})
 
 
+@require_http_methods(["POST"])
+def airnav_verify(request):
+    """飞机信息标准库编辑前的 AIRNAV 密码校验（密码由环境变量 AIRNAV_PASSWORD 配置，默认 73409）。"""
+    try:
+        body = _json_body(request)
+        password = str(body.get("password", ""))
+    except ValueError:
+        password = ""
+    expected = os.getenv("AIRNAV_PASSWORD", "73409")
+    if password and password == expected:
+        return JsonResponse({"ok": True, "verified": True})
+    return JsonResponse({"ok": False, "verified": False, "error": "AIRNAV 密码错误"}, status=403)
+
+
 @require_http_methods(["GET"])
 def cloudbase_status(request):
     # 只返回是否完成配置，绝不把 API Key 内容发送给客户端。
@@ -89,8 +125,15 @@ def cloudbase_status(request):
         {
             "ok": True,
             "env_id": os.getenv("CLOUDBASE_ENV_ID", ""),
-            "configured": bool(api_key and not api_key.startswith("replace-")),
-            "collections": [PROJECTS, TEMPLATES, TOOL_CART],
+        "configured": bool(api_key and not api_key.startswith("replace-")),
+        "collections": [
+            PROJECTS,
+            TEMPLATES,
+            MATERIAL_TEMPLATES,
+            TOOL_CART,
+            AIRCRAFT_INFO,
+            WORKCARD_320,
+        ],
         }
     )
 
@@ -101,7 +144,7 @@ def poll(request):
     try:
         revision = calculate_revision(
             get_nosql_client(),
-            (PROJECTS, TEMPLATES, TOOL_CART),
+            (PROJECTS, TEMPLATES, MATERIAL_TEMPLATES, TOOL_CART, AIRCRAFT_INFO, WORKCARD_320),
         )
         # 首次不带 revision 只建立基线；之后仅在值不同时报告 changed。
         previous = request.GET.get("revision", "").strip().strip('"')
@@ -156,15 +199,26 @@ def projects(request):
         if aircraft_type not in AIRCRAFT_TYPES:
             return _error("aircraft_type 只支持 A320 或 B787", 400)
 
+        project_type = str(body.get("type", "")).strip()
+        if project_type and project_type not in PROJECT_TYPES:
+            return _error("type 只支持 A检/零散/换发/换APU/单独项目", 400)
+
         now = _now()
         document = {
             # 客户端生成 ID 会让失败重试更复杂，因此由可信后端统一生成。
             "_id": uuid4().hex,
             "name": name,
             "aircraft_type": aircraft_type,
+            "type": project_type,
             "team": str(body.get("team", "")).strip(),
             "sections": body.get("sections", []),
             "use_tool_cart": bool(body.get("use_tool_cart", False)),
+            # A检项目的两个子结构；非 A检项目这两个字段保持为空。
+            "prep_sheet": body.get("prep_sheet", {}),
+            "workcard_assignment": body.get("workcard_assignment", {}),
+            # 「单独项目」的两个子结构；非单独项目保持为空。
+            "standalone_prep_sheet": body.get("standalone_prep_sheet", {}),
+            "material_list": body.get("material_list", []),
             "created_at": now,
             "updated_at": now,
             "version": 1,
@@ -196,9 +250,14 @@ def project_detail(request, project_id):
         allowed = {
             "name",
             "aircraft_type",
+            "type",
             "team",
             "sections",
             "use_tool_cart",
+            "prep_sheet",
+            "workcard_assignment",
+            "standalone_prep_sheet",
+            "material_list",
         }
         updates = {key: value for key, value in body.items() if key in allowed}
         if not updates:
@@ -207,8 +266,24 @@ def project_detail(request, project_id):
             updates["aircraft_type"] = str(updates["aircraft_type"]).upper()
             if updates["aircraft_type"] not in AIRCRAFT_TYPES:
                 return _error("aircraft_type 只支持 A320 或 B787", 400)
+        if "type" in updates:
+            updates["type"] = str(updates["type"]).strip()
+            if updates["type"] and updates["type"] not in PROJECT_TYPES:
+                return _error("type 只支持 A检/零散/换发/换APU/单独项目", 400)
         if "sections" in updates and not isinstance(updates["sections"], list):
             return _error("sections 必须是数组", 400)
+        if "prep_sheet" in updates and not isinstance(updates["prep_sheet"], dict):
+            return _error("prep_sheet 必须是对象", 400)
+        if "workcard_assignment" in updates and not isinstance(
+            updates["workcard_assignment"], dict
+        ):
+            return _error("workcard_assignment 必须是对象", 400)
+        if "standalone_prep_sheet" in updates and not isinstance(
+            updates["standalone_prep_sheet"], dict
+        ):
+            return _error("standalone_prep_sheet 必须是对象", 400)
+        if "material_list" in updates and not isinstance(updates["material_list"], list):
+            return _error("material_list 必须是数组", 400)
         updates["updated_at"] = _now()
         result = client.update_document(
             PROJECTS,
@@ -259,6 +334,41 @@ def aircraft_template(request, aircraft_type):
 
 
 @require_http_methods(["GET", "PUT"])
+def material_template(request, aircraft_type):
+    """航材标准库（A320 / B787）：结构与工具标准库一致（sections），物品 item 含 partNo。"""
+    aircraft_type = aircraft_type.upper()
+    if aircraft_type not in AIRCRAFT_TYPES:
+        return _error("机型只支持 A320 或 B787", 404)
+    try:
+        client = get_nosql_client()
+        if request.method == "GET":
+            return JsonResponse(
+                {"ok": True, "data": client.get_document(MATERIAL_TEMPLATES, aircraft_type)}
+            )
+        body = _json_body(request)
+        sections = body.get("sections", [])
+        if not isinstance(sections, list):
+            return _error("sections 必须是数组", 400)
+        result = client.update_document(
+            MATERIAL_TEMPLATES,
+            aircraft_type,
+            {
+                "$set": {
+                    "aircraft_type": aircraft_type,
+                    "sections": sections,
+                    "updated_at": _now(),
+                }
+            },
+            upsert=True,
+        )
+        return JsonResponse({"ok": True, "result": result})
+    except ValueError as exc:
+        return _error(str(exc), 400)
+    except (CloudBaseConfigError, CloudBaseAPIError) as exc:
+        return _handle_cloudbase_error(exc)
+
+
+@require_http_methods(["GET", "PUT"])
 def tool_cart(request):
     try:
         client = get_nosql_client()
@@ -275,6 +385,69 @@ def tool_cart(request):
             "default",
             {"$set": {"items": items, "updated_at": _now()}},
             # 工具车使用固定文档 ID，首次保存时允许直接创建。
+            upsert=True,
+        )
+        return JsonResponse({"ok": True, "result": result})
+    except ValueError as exc:
+        return _error(str(exc), 400)
+    except (CloudBaseConfigError, CloudBaseAPIError) as exc:
+        return _handle_cloudbase_error(exc)
+
+
+@require_http_methods(["GET", "PUT"])
+def announcement(request):
+    """一级页面公告栏：单文档存储，GET 读取，PUT 整体替换 content 字段。"""
+    try:
+        client = get_nosql_client()
+        if request.method == "GET":
+            return JsonResponse(
+                {"ok": True, "data": client.get_document(ANNOUNCEMENT, "default")}
+            )
+        body = _json_body(request)
+        content = body.get("content", "")
+        if not isinstance(content, str):
+            return _error("content 必须是字符串", 400)
+        result = client.update_document(
+            ANNOUNCEMENT,
+            "default",
+            {"$set": {"content": content, "updated_at": _now()}},
+            upsert=True,
+        )
+        return JsonResponse({"ok": True, "result": result})
+    except ValueError as exc:
+        return _error(str(exc), 400)
+    except (CloudBaseConfigError, CloudBaseAPIError) as exc:
+        return _handle_cloudbase_error(exc)
+
+
+@require_http_methods(["GET", "PUT"])
+def standard_library(request, lib_key):
+    """三类标准库的读写：飞机信息 / 320 工卡分配 / 787 工卡分配。
+
+    标准库整体以 rows 数组存储，GET 返回整库（导出/编辑），PUT 整体替换
+    rows（导入）。单行的「新增/删除」由前端修改本地 rows 数组后再 PUT 完成。
+    """
+    if lib_key not in STANDARD_LIBRARIES:
+        return _error("未知的标准库", 404)
+    meta = STANDARD_LIBRARIES[lib_key]
+    collection, doc_id = meta["collection"], meta["doc_id"]
+    try:
+        client = get_nosql_client()
+        if request.method == "GET":
+            return JsonResponse(
+                {"ok": True, "data": client.get_document(collection, doc_id)}
+            )
+        body = _json_body(request)
+        rows = body.get("rows", [])
+        if not isinstance(rows, list):
+            return _error("rows 必须是数组", 400)
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                return _error(f"第 {index + 1} 行必须是对象", 400)
+        result = client.update_document(
+            collection,
+            doc_id,
+            {"$set": {"rows": rows, "updated_at": _now()}},
             upsert=True,
         )
         return JsonResponse({"ok": True, "result": result})

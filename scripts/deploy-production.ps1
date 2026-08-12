@@ -44,15 +44,6 @@ function Read-DotEnv([string]$Path) {
     return $values
 }
 
-function Get-ConfigurationValue([hashtable]$Configuration, [string]$Name) {
-    # GitHub Actions 等 CI 环境直接注入变量；本地部署继续读取被忽略的 .env。
-    $environmentValue = [Environment]::GetEnvironmentVariable($Name)
-    if ($environmentValue) {
-        return $environmentValue
-    }
-    return $Configuration[$Name]
-}
-
 function New-ProductionSecret {
     # 首次部署生成高熵密钥并保存到被 Git 忽略的 .env，后续部署保持不变。
     $bytes = New-Object byte[] 48
@@ -248,18 +239,13 @@ try {
     Build-ProductionPackage
 
     $configuration = Read-DotEnv $envPath
-    $envId = Get-ConfigurationValue $configuration "CLOUDBASE_ENV_ID"
-    # MCP 会优先使用 CLOUDBASE_API_KEY，导致 CI 中的全权限 CAM 密钥被忽略。
-    # 因此流水线使用独立变量传递应用侧 API Key；本地仍从 .env 读取原名称。
-    $apiKey = [Environment]::GetEnvironmentVariable("TOOLBOX_CLOUDBASE_API_KEY")
-    if (-not $apiKey) {
-        $apiKey = $configuration["CLOUDBASE_API_KEY"]
-    }
+    $envId = $configuration["CLOUDBASE_ENV_ID"]
+    $apiKey = $configuration["CLOUDBASE_API_KEY"]
     if (-not $envId) {
-        throw "CLOUDBASE_ENV_ID is missing from the environment and .env"
+        throw "CLOUDBASE_ENV_ID is missing from .env"
     }
     if (-not $apiKey -or $apiKey.StartsWith("replace-")) {
-        throw "CLOUDBASE_API_KEY is missing from the environment and .env"
+        throw "CLOUDBASE_API_KEY is missing from .env"
     }
 
     $mcpCli = Get-CloudBaseMcpCli
@@ -291,19 +277,11 @@ try {
         return
     }
 
-    $productionSecret = Get-ConfigurationValue $configuration "DJANGO_PRODUCTION_SECRET_KEY"
+    $productionSecret = $configuration["DJANGO_PRODUCTION_SECRET_KEY"]
     if (-not $productionSecret) {
-        if ($env:CI) {
-            throw "DJANGO_PRODUCTION_SECRET_KEY is required in CI so deployments keep a stable Django secret."
-        }
         $productionSecret = New-ProductionSecret
         Add-Content -LiteralPath $envPath -Value "`nDJANGO_PRODUCTION_SECRET_KEY=$productionSecret"
         Write-Host "Created a stable production Django secret in the ignored .env file."
-    }
-
-    $csrfTrustedOrigins = Get-ConfigurationValue $configuration "CSRF_TRUSTED_ORIGINS"
-    if (-not $csrfTrustedOrigins) {
-        $csrfTrustedOrigins = "https://fe-da-tool-list-d2g0awsejc0658949.webapps.tcloudbase.com,https://da-tool-list-d2g0awsejc0658949-1464163374.tcloudbaseapp.com"
     }
 
     $environment = @{
@@ -312,7 +290,7 @@ try {
         CLOUDBASE_API_KEY = $apiKey
         CLOUDBASE_NOSQL_INSTANCE = "(default)"
         CLOUDBASE_NOSQL_DATABASE = "(default)"
-        CSRF_TRUSTED_ORIGINS = $csrfTrustedOrigins
+        CSRF_TRUSTED_ORIGINS = "https://fe-da-tool-list-d2g0awsejc0658949.webapps.tcloudbase.com,https://da-tool-list-d2g0awsejc0658949-1464163374.tcloudbaseapp.com"
         PYTHONUNBUFFERED = "1"
     }
 
@@ -341,35 +319,10 @@ try {
         if (-not $configResult.success) {
             throw $configResult.message
         }
-        $codeResult = $null
-        # GitHub 托管 Runner 到腾讯云 COS 的跨境上传偶尔会触发 MCP 的 60 秒超时。
-        # 每次重试都会重新申请临时上传地址，不复用可能已失效的签名。
-        for ($uploadAttempt = 1; $uploadAttempt -le 2; $uploadAttempt++) {
-            try {
-                $codeResult = Invoke-McpTool "manageFunctions" @{
-                    action = "updateFunctionCode"
-                    functionName = $FunctionName
-                    functionRootPath = $stageRoot
-                }
-            }
-            catch {
-                if ($uploadAttempt -ge 2) {
-                    throw
-                }
-                Write-Warning "Function code upload attempt $uploadAttempt terminated the MCP process: $($_.Exception.Message). Retrying..."
-                Stop-Mcp
-                Start-Mcp $mcpCli
-                continue
-            }
-            if ($codeResult.success) {
-                break
-            }
-            if ($uploadAttempt -lt 2) {
-                Write-Warning "Function code upload attempt $uploadAttempt failed: $($codeResult.message). Retrying..."
-                Stop-Mcp
-                Start-Mcp $mcpCli
-                Start-Sleep -Seconds 10
-            }
+        $codeResult = Invoke-McpTool "manageFunctions" @{
+            action = "updateFunctionCode"
+            functionName = $FunctionName
+            functionRootPath = $stageRoot
         }
         if (-not $codeResult.success) {
             throw $codeResult.message

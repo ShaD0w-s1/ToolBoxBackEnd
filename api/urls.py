@@ -7,10 +7,14 @@ from . import views
 urlpatterns = [
     path("", views.index),
     path("api/csrf/", views.csrf),
+    path("api/airnav-verify/", views.airnav_verify),
     path("api/cloudbase/status/", views.cloudbase_status),
     path("api/poll/", views.poll),
     path("api/projects/", views.projects),
     path("api/projects/<str:project_id>/", views.project_detail),
     path("api/templates/<str:aircraft_type>/", views.aircraft_template),
+    path("api/material-templates/<str:aircraft_type>/", views.material_template),
     path("api/tool-cart/", views.tool_cart),
+    path("api/announcement/", views.announcement),
+    path("api/standard-libraries/<str:lib_key>/", views.standard_library),
 ]

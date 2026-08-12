@@ -186,7 +186,7 @@ class CloudBaseNoSQLClient:
         upsert: bool = False,
     ) -> Any:
         path = f"{self._collection_path(collection)}/{quote(document_id, safe='')}"
-        return self._request(
+        result = self._request(
             "PATCH",
             path,
             body={
@@ -196,6 +196,24 @@ class CloudBaseNoSQLClient:
                 "returnDoc": True,
             },
         )
+        # CloudBase HTTP API 的 upsert 对不存在的 document_id 可能不生效
+        #（返回 matched=0 且 upsert_id 为空）。此时 fallback 到 insert。
+        if (
+            upsert
+            and isinstance(result, dict)
+            and result.get("matched") == 0
+            and not result.get("upsert_id")
+        ):
+            # 从 $set 中提取字段构造完整文档（含 _id），兼容 $set 包裹和裸对象两种调用形式。
+            doc: dict[str, Any] = {}
+            set_payload = data.get("$set") if isinstance(data, dict) else None
+            if isinstance(set_payload, dict):
+                doc.update(set_payload)
+            elif isinstance(data, dict):
+                doc.update(data)
+            doc["_id"] = document_id
+            return self.insert_document(collection, doc)
+        return result
 
     def delete_document(self, collection: str, document_id: str) -> Any:
         path = f"{self._collection_path(collection)}/{quote(document_id, safe='')}"
