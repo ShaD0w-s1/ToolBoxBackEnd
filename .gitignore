@@ -29,3 +29,6 @@ htmlcov/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Deploy staging (regenerable from api/ + vendored deps)
+.deploy/
