@@ -218,3 +218,29 @@ class CloudBaseNoSQLClient:
     def delete_document(self, collection: str, document_id: str) -> Any:
         path = f"{self._collection_path(collection)}/{quote(document_id, safe='')}"
         return self._request("DELETE", path)
+
+    def update_documents_where(
+        self,
+        collection: str,
+        query: dict[str, Any],
+        data: dict[str, Any],
+        *,
+        multi: bool = False,
+        upsert: bool = False,
+    ) -> Any:
+        """根据查询条件原子更新文档（MongoDB updateOne/updateMany 语义）。
+
+        这是乐观锁的原子实现基础：把 version 放进 query，只有版本匹配时才更新，
+        返回 matched 数，客户端据此判断是否发生并发冲突。
+        """
+        return self._request(
+            "PATCH",
+            self._collection_path(collection),
+            body={
+                "query": query,
+                "data": data,
+                "multi": multi,
+                "upsert": upsert,
+                "replaceMode": False,
+            },
+        )

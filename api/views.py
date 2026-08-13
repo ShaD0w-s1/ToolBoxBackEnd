@@ -273,26 +273,8 @@ def project_detail(request, project_id):
             return JsonResponse({"ok": True, "result": result})
 
         body = _json_body(request)
-        # 乐观锁：客户端带上 expected_version，版本不符则返回 409，避免并发覆盖。
+        # 乐观锁：客户端带上 expected_version，用原子条件写实现（version 放进 query）。
         expected_version = body.get("expected_version")
-        if expected_version is not None:
-            try:
-                current = client.get_document(PROJECTS, project_id)
-            except CloudBaseAPIError as exc:
-                # 文档不存在（如云端创建失败、仅存本地）：视为版本 0，继续走 PATCH（matched=0 无副作用）。
-                if exc.status == 404:
-                    current = {}
-                else:
-                    raise
-            current_version = (
-                int(current.get("version", 0)) if isinstance(current, dict) else 0
-            )
-            if current_version != int(expected_version):
-                return _error(
-                    "数据已被他人修改，请刷新后重试",
-                    409,
-                    {"current_version": current_version, "expected_version": expected_version},
-                )
         allowed = {
             "name",
             "aircraft_type",
@@ -331,12 +313,33 @@ def project_detail(request, project_id):
         if "material_list" in updates and not isinstance(updates["material_list"], list):
             return _error("material_list 必须是数组", 400)
         updates["updated_at"] = _now()
-        result = client.update_document(
-            PROJECTS,
-            project_id,
-            # version 每次写入都原子递增，供冲突检测和审计使用。
-            {"$set": updates, "$inc": {"version": 1}},
-        )
+        if expected_version is not None:
+            # 原子乐观锁：单次请求内「版本匹配 + 更新」同时完成，消除读改写竞态。
+            result = client.update_documents_where(
+                PROJECTS,
+                {"_id": project_id, "version": int(expected_version)},
+                {"$set": updates, "$inc": {"version": 1}},
+            )
+            if not isinstance(result, dict) or result.get("matched", 0) == 0:
+                current_version = None
+                try:
+                    current = client.get_document(PROJECTS, project_id)
+                    if isinstance(current, dict):
+                        current_version = int(current.get("version", 0))
+                except CloudBaseAPIError:
+                    pass
+                return _error(
+                    "数据已被他人修改，请刷新后重试",
+                    409,
+                    {"current_version": current_version, "expected_version": expected_version},
+                )
+        else:
+            result = client.update_document(
+                PROJECTS,
+                project_id,
+                # version 每次写入都原子递增，供冲突检测和审计使用。
+                {"$set": updates, "$inc": {"version": 1}},
+            )
         _bump_revision(client)
         return JsonResponse({"ok": True, "result": result})
     except ValueError as exc:
