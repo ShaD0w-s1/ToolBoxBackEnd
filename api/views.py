@@ -19,7 +19,7 @@ from .cloudbase_nosql import (
     CloudBaseConfigError,
     CloudBaseNoSQLClient,
 )
-from .polling import PollingPayloadError, calculate_revision
+from .polling import PollingPayloadError
 
 
 # 本地开发可通过前缀使用独立测试集合；生产环境保持空前缀。
@@ -31,6 +31,9 @@ TOOL_CART = f"{COLLECTION_PREFIX}tool_cart"
 AIRCRAFT_INFO = f"{COLLECTION_PREFIX}aircraft_info"
 WORKCARD_320 = f"{COLLECTION_PREFIX}workcard_lib_320"
 ANNOUNCEMENT = f"{COLLECTION_PREFIX}announcement"
+# 变更日志：单计数器文档，作为 poll 的轻量 revision 来源（替代全量集合哈希）。
+CHANGE_LOG = f"{COLLECTION_PREFIX}work_change_log"
+REVISION_DOC_ID = "revision"
 AIRCRAFT_TYPES = {"A320", "B787"}
 
 # 工作项目可选类型；空字符串表示历史遗留项目（仅有工具清单）。
@@ -87,6 +90,30 @@ def get_nosql_client() -> CloudBaseNoSQLClient:
     return CloudBaseNoSQLClient()
 
 
+def _bump_revision(client: CloudBaseNoSQLClient) -> None:
+    """递增单计数器文档 seq，作为全局单调递增的 revision 来源。
+
+    每次写操作成功后调用。计数器文档尚不存在时自动创建（seq=1）。
+    """
+    result = client.update_document(
+        CHANGE_LOG, REVISION_DOC_ID, {"$inc": {"seq": 1}}, upsert=False
+    )
+    if isinstance(result, dict) and result.get("matched") == 0:
+        client.insert_document(CHANGE_LOG, {"_id": REVISION_DOC_ID, "seq": 1})
+
+
+def _read_revision(client: CloudBaseNoSQLClient) -> str:
+    """读取计数器文档的 seq，作为当前 revision。文档不存在视为 0。"""
+    try:
+        doc = client.get_document(CHANGE_LOG, REVISION_DOC_ID)
+    except CloudBaseAPIError as exc:
+        if exc.status == 404:
+            return "0"
+        raise
+    seq = int(doc.get("seq", 0)) if isinstance(doc, dict) else 0
+    return str(seq)
+
+
 def index(request):
     return JsonResponse(
         {
@@ -140,12 +167,9 @@ def cloudbase_status(request):
 
 @require_http_methods(["GET"])
 def poll(request):
-    """返回所有用户可见业务数据的稳定修订值。"""
+    """返回所有用户可见业务数据的稳定修订值（来自单计数器文档，成本 O(1) 读）。"""
     try:
-        revision = calculate_revision(
-            get_nosql_client(),
-            (PROJECTS, TEMPLATES, MATERIAL_TEMPLATES, TOOL_CART, AIRCRAFT_INFO, WORKCARD_320),
-        )
+        revision = _read_revision(get_nosql_client())
         # 首次不带 revision 只建立基线；之后仅在值不同时报告 changed。
         previous = request.GET.get("revision", "").strip().strip('"')
         response = JsonResponse(
@@ -162,9 +186,6 @@ def poll(request):
         return response
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
         return _handle_cloudbase_error(exc)
-    except PollingPayloadError as exc:
-        # 上游返回未知结构时必须明确失败，不能把它误判成“集合为空”。
-        return _error(str(exc), 502)
 
 
 @require_http_methods(["GET", "POST"])
@@ -226,6 +247,7 @@ def projects(request):
         if not isinstance(document["sections"], list):
             return _error("sections 必须是数组", 400)
         client.insert_document(PROJECTS, document)
+        _bump_revision(client)
         return JsonResponse({"ok": True, "data": document}, status=201)
     except ValueError as exc:
         return _error(str(exc), 400)
@@ -242,11 +264,31 @@ def project_detail(request, project_id):
                 {"ok": True, "data": client.get_document(PROJECTS, project_id)}
             )
         if request.method == "DELETE":
-            return JsonResponse(
-                {"ok": True, "result": client.delete_document(PROJECTS, project_id)}
-            )
+            result = client.delete_document(PROJECTS, project_id)
+            _bump_revision(client)
+            return JsonResponse({"ok": True, "result": result})
 
         body = _json_body(request)
+        # 乐观锁：客户端带上 expected_version，版本不符则返回 409，避免并发覆盖。
+        expected_version = body.get("expected_version")
+        if expected_version is not None:
+            try:
+                current = client.get_document(PROJECTS, project_id)
+            except CloudBaseAPIError as exc:
+                # 文档不存在（如云端创建失败、仅存本地）：视为版本 0，继续走 PATCH（matched=0 无副作用）。
+                if exc.status == 404:
+                    current = {}
+                else:
+                    raise
+            current_version = (
+                int(current.get("version", 0)) if isinstance(current, dict) else 0
+            )
+            if current_version != int(expected_version):
+                return _error(
+                    "数据已被他人修改，请刷新后重试",
+                    409,
+                    {"current_version": current_version, "expected_version": expected_version},
+                )
         allowed = {
             "name",
             "aircraft_type",
@@ -288,9 +330,10 @@ def project_detail(request, project_id):
         result = client.update_document(
             PROJECTS,
             project_id,
-            # version 每次写入都原子递增，供后续冲突检测和审计使用。
+            # version 每次写入都原子递增，供冲突检测和审计使用。
             {"$set": updates, "$inc": {"version": 1}},
         )
+        _bump_revision(client)
         return JsonResponse({"ok": True, "result": result})
     except ValueError as exc:
         return _error(str(exc), 400)
@@ -326,6 +369,7 @@ def aircraft_template(request, aircraft_type):
             # 标准库首次保存时可能尚不存在，因此允许原子创建或更新。
             upsert=True,
         )
+        _bump_revision(client)
         return JsonResponse({"ok": True, "result": result})
     except ValueError as exc:
         return _error(str(exc), 400)
@@ -361,6 +405,7 @@ def material_template(request, aircraft_type):
             },
             upsert=True,
         )
+        _bump_revision(client)
         return JsonResponse({"ok": True, "result": result})
     except ValueError as exc:
         return _error(str(exc), 400)
@@ -387,6 +432,7 @@ def tool_cart(request):
             # 工具车使用固定文档 ID，首次保存时允许直接创建。
             upsert=True,
         )
+        _bump_revision(client)
         return JsonResponse({"ok": True, "result": result})
     except ValueError as exc:
         return _error(str(exc), 400)
@@ -413,6 +459,7 @@ def announcement(request):
             {"$set": {"content": content, "updated_at": _now()}},
             upsert=True,
         )
+        _bump_revision(client)
         return JsonResponse({"ok": True, "result": result})
     except ValueError as exc:
         return _error(str(exc), 400)
@@ -450,6 +497,7 @@ def standard_library(request, lib_key):
             {"$set": {"rows": rows, "updated_at": _now()}},
             upsert=True,
         )
+        _bump_revision(client)
         return JsonResponse({"ok": True, "result": result})
     except ValueError as exc:
         return _error(str(exc), 400)
