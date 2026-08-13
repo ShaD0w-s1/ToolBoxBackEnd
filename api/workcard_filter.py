@@ -160,6 +160,24 @@ def eng_apu_match(name: str, apu_names: list) -> bool:
     return shares_3_chars(name, apu_names)
 
 
+def _sub_matches(sub: str, names: list, lube_names: list, clean_names: list) -> bool:
+    """卡片名称与工卡名称的 3 连续字匹配，含「润滑/清洁」优先规则。
+
+    - 名称含「（润滑）」：优先用「含润滑的工卡名称」子集匹配；不同时满足（无该子集或不命中）
+      则回退用全部工卡名称做普通 3 连续字匹配。
+    - 名称含「（清洁）」：同理。
+    """
+    if re.search(r"[（(]润滑[）)]", sub):
+        if lube_names and shares_3_chars(sub, lube_names):
+            return True
+        return shares_3_chars(sub, names)
+    if re.search(r"[（(]清洁[）)]", sub):
+        if clean_names and shares_3_chars(sub, clean_names):
+            return True
+        return shares_3_chars(sub, names)
+    return shares_3_chars(sub, names)
+
+
 # —— 工卡分配 ——
 
 def _lookup_aircraft(aircraft_rows: list, reg_no: str):
@@ -256,7 +274,8 @@ def _ensure_section(sections: list, cat: str) -> dict:
 
 
 def _filter_sections(project_sections: list, lib_sections: list, names: list,
-                     apu_names: list, engine: str, keep_full: set) -> tuple:
+                     apu_names: list, lube_names: list, clean_names: list,
+                     engine: str, keep_full: set) -> tuple:
     """核心筛选：删除不匹配的 work，补充匹配且缺失的 work。
 
     返回 (new_project_sections, deleted, added)。
@@ -292,7 +311,7 @@ def _filter_sections(project_sections: list, lib_sections: list, names: list,
                     else:
                         deleted += 1
                     continue
-                if shares_3_chars(sub, names):
+                if _sub_matches(sub, names, lube_names, clean_names):
                     if is_eng and not eng_engine_match(sub, engine):
                         deleted += 1
                         continue
@@ -313,9 +332,10 @@ def _filter_sections(project_sections: list, lib_sections: list, names: list,
                 if is_eng and not is_fixed and is_apu:
                     if not eng_apu_match(sub, apu_names):
                         continue
-                elif not full_ref and not is_fixed and not shares_3_chars(sub, names):
+                elif not full_ref and not is_fixed and not _sub_matches(sub, names, lube_names, clean_names):
                     continue
-                if is_eng and not is_fixed and not eng_engine_match(sub, engine):
+                # 需求2：固定卡片补回也受发动机匹配（不再跳过）。
+                if is_eng and not eng_engine_match(sub, engine):
                     continue
                 if sub in existing:
                     continue
@@ -326,12 +346,14 @@ def _filter_sections(project_sections: list, lib_sections: list, names: list,
     return project_sections, deleted, added
 
 
-def apply_tool_filter(project_sections: list, lib_sections: list, names: list, apu_names: list, engine: str) -> tuple:
-    return _filter_sections(project_sections, lib_sections, names, apu_names, engine, TOOL_KEEP_FULL)
+def apply_tool_filter(project_sections: list, lib_sections: list, names: list, apu_names: list,
+                      lube_names: list, clean_names: list, engine: str) -> tuple:
+    return _filter_sections(project_sections, lib_sections, names, apu_names, lube_names, clean_names, engine, TOOL_KEEP_FULL)
 
 
-def apply_material_filter(project_sections: list, lib_sections: list, names: list, apu_names: list, engine: str) -> tuple:
-    return _filter_sections(project_sections, lib_sections, names, apu_names, engine, MATERIAL_KEEP_FULL)
+def apply_material_filter(project_sections: list, lib_sections: list, names: list, apu_names: list,
+                          lube_names: list, clean_names: list, engine: str) -> tuple:
+    return _filter_sections(project_sections, lib_sections, names, apu_names, lube_names, clean_names, engine, MATERIAL_KEEP_FULL)
 
 
 def collect_workcard_names(assignment: dict) -> list:
@@ -370,6 +392,15 @@ def collect_apu_workcard_names(assignment: dict) -> list:
         n = (c.get("工卡名称") or "").strip()
         if n and n not in seen:
             seen.add(n)
+            out.append(n)
+    return out
+
+
+def collect_keyword_names(assignment: dict, keyword: str) -> list:
+    """收集工卡名称中含某关键词的子集（如「润滑」「清洁」）。"""
+    out = []
+    for n in collect_workcard_names(assignment):
+        if keyword in n:
             out.append(n)
     return out
 

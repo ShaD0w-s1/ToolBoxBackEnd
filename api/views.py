@@ -28,6 +28,7 @@ from .workcard_filter import (
     apply_tool_filter,
     apply_work_card_list,
     collect_apu_workcard_names,
+    collect_keyword_names,
     collect_workcard_names,
 )
 
@@ -703,18 +704,20 @@ def apply_workcard(request, project_id):
         material_lib = _read_std_sections(client, MATERIAL_TEMPLATES, aircraft_type)
         names = collect_workcard_names(assignment)
         apu_names = collect_apu_workcard_names(assignment)
+        lube_names = collect_keyword_names(assignment, "润滑")
+        clean_names = collect_keyword_names(assignment, "清洁")
         engine = str((prep_sheet.get("base") or {}).get("发动机", ""))
 
         # 2) 工具清单筛选（data → sections）
         project_sections = project_doc.get("sections") if isinstance(project_doc.get("sections"), list) else []
         tool_sections, tool_deleted, tool_added = apply_tool_filter(
-            project_sections, tool_lib, names, apu_names, engine
+            project_sections, tool_lib, names, apu_names, lube_names, clean_names, engine
         )
 
         # 3) 航材清单筛选（material_list → sections）
         material_sections = project_doc.get("material_list") if isinstance(project_doc.get("material_list"), list) else []
         material_sections, mat_deleted, mat_added = apply_material_filter(
-            material_sections, material_lib, names, apu_names, engine
+            material_sections, material_lib, names, apu_names, lube_names, clean_names, engine
         )
 
         updates = {
