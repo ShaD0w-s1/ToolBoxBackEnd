@@ -4,8 +4,11 @@
 轮询修订计算集中在 polling，避免业务入口承担过多职责。
 """
 
+import hashlib
+import hmac
 import json
 import os
+import time
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -34,7 +37,14 @@ ANNOUNCEMENT = f"{COLLECTION_PREFIX}announcement"
 # 变更日志：单计数器文档，作为 poll 的轻量 revision 来源（替代全量集合哈希）。
 CHANGE_LOG = f"{COLLECTION_PREFIX}work_change_log"
 REVISION_DOC_ID = "revision"
+# 应用运行时配置（远端下发）：watch 实时推送开关与阈值。
+APP_CONFIG = f"{COLLECTION_PREFIX}app_config"
 AIRCRAFT_TYPES = {"A320", "B787"}
+
+# AIRNAV 短期授权 token 有效期（秒）。
+AIRNAV_TOKEN_TTL = 30 * 60
+# 暴力破解限流：失败次数与冷却时间（内存态，单实例内有效，作为第一道防线）。
+_AIRNAV_RATE: dict[str, dict] = {}
 
 # 工作项目可选类型；空字符串表示历史遗留项目（仅有工具清单）。
 PROJECT_TYPES = {"A检", "零散", "换发", "换APU", "单独项目"}
@@ -134,17 +144,88 @@ def csrf(request):
     return JsonResponse({"ok": True, "csrf_token": get_token(request)})
 
 
+def _client_ip(request: HttpRequest) -> str:
+    """尽量还原真实客户端 IP（经 CloudBase 网关时可能带 X-Forwarded-For）。"""
+    xff = request.META.get("HTTP_X_FORWARDED_FOR", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.META.get("REMOTE_ADDR", "unknown")
+
+
+def _airnav_secret() -> str:
+    """token 签名密钥：优先 Django 生产/本地密钥，兜底 AIRNAV 密码。"""
+    return (
+        os.getenv("DJANGO_PRODUCTION_SECRET_KEY")
+        or os.getenv("DJANGO_SECRET_KEY")
+        or os.getenv("AIRNAV_PASSWORD")
+        or ""
+    )
+
+
+def _issue_airnav_token() -> tuple[str, int]:
+    """签发短期 token（expiry.signature），供飞机信息读取鉴权使用。"""
+    secret = _airnav_secret()
+    expiry = int(time.time()) + AIRNAV_TOKEN_TTL
+    sig = hmac.new(secret.encode("utf-8"), str(expiry).encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{expiry}.{sig}", expiry
+
+
+def _verify_airnav_token(token: str) -> bool:
+    """校验 token 的签名与有效期（防篡改、防过期）。"""
+    secret = _airnav_secret()
+    if not secret or not token:
+        return False
+    try:
+        expiry_str, sig = token.split(".", 1)
+        expiry = int(expiry_str)
+    except (ValueError, AttributeError):
+        return False
+    if int(time.time()) > expiry:
+        return False
+    expected = hmac.new(secret.encode("utf-8"), expiry_str.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, expected)
+
+
+def _airnav_throttled(ip: str) -> bool:
+    entry = _AIRNAV_RATE.get(ip)
+    return bool(entry) and time.time() < entry["until"]
+
+
+def _airnav_fail(ip: str) -> None:
+    entry = _AIRNAV_RATE.setdefault(ip, {"fail": 0, "until": 0.0})
+    entry["fail"] += 1
+    # 指数退避：5s、10s、20s…上限 300s
+    entry["until"] = time.time() + min(5 * (2 ** (entry["fail"] - 1)), 300)
+
+
+def _airnav_ok(ip: str) -> None:
+    _AIRNAV_RATE.pop(ip, None)
+
+
 @require_http_methods(["POST"])
 def airnav_verify(request):
-    """飞机信息标准库编辑前的 AIRNAV 密码校验（密码由环境变量 AIRNAV_PASSWORD 配置，默认 73409）。"""
+    """飞机信息标准库读取/编辑前的 AIRNAV 密码校验。
+
+    密码只由环境变量 AIRNAV_PASSWORD 提供；未配置时直接 503，绝不复用任何
+    硬编码默认值（历史默认 73409 已移除）。校验成功后签发短期 token，
+    供后续读取飞机信息（GET /api/standard-libraries/aircraft_info/）使用。
+    """
+    expected = os.getenv("AIRNAV_PASSWORD")
+    if not expected:
+        return _error("服务端未配置 AIRNAV_PASSWORD，无法校验", 503)
+    ip = _client_ip(request)
+    if _airnav_throttled(ip):
+        return _error("尝试过于频繁，请稍后再试", 429)
     try:
         body = _json_body(request)
         password = str(body.get("password", ""))
     except ValueError:
         password = ""
-    expected = os.getenv("AIRNAV_PASSWORD", "73409")
-    if password and password == expected:
-        return JsonResponse({"ok": True, "verified": True})
+    if password and hmac.compare_digest(password.encode("utf-8"), expected.encode("utf-8")):
+        _airnav_ok(ip)
+        token, _ = _issue_airnav_token()
+        return JsonResponse({"ok": True, "verified": True, "token": token, "expires_in": AIRNAV_TOKEN_TTL})
+    _airnav_fail(ip)
     return JsonResponse({"ok": False, "verified": False, "error": "AIRNAV 密码错误"}, status=403)
 
 
@@ -488,6 +569,11 @@ def standard_library(request, lib_key):
     try:
         client = get_nosql_client()
         if request.method == "GET":
+            # 飞机信息（机号/FSN/发动机等）属敏感数据：读取需持有 AIRNAV 短期 token。
+            if lib_key == "aircraft_info":
+                token = request.META.get("HTTP_X_AIRNAV_TOKEN", "")
+                if not _verify_airnav_token(token):
+                    return _error("需要 AIRNAV 授权才能读取飞机信息", 403)
             return JsonResponse(
                 {"ok": True, "data": client.get_document(collection, doc_id)}
             )
@@ -495,6 +581,11 @@ def standard_library(request, lib_key):
         rows = body.get("rows", [])
         if not isinstance(rows, list):
             return _error("rows 必须是数组", 400)
+        # 飞机信息的写入同样需要 AIRNAV 授权（编辑前已过密码门，此处校验 token）。
+        if lib_key == "aircraft_info":
+            token = request.META.get("HTTP_X_AIRNAV_TOKEN", "")
+            if not _verify_airnav_token(token):
+                return _error("需要 AIRNAV 授权才能修改飞机信息", 403)
         for index, row in enumerate(rows):
             if not isinstance(row, dict):
                 return _error(f"第 {index + 1} 行必须是对象", 400)
@@ -510,3 +601,31 @@ def standard_library(request, lib_key):
         return _error(str(exc), 400)
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
         return _handle_cloudbase_error(exc)
+
+
+@require_http_methods(["GET"])
+def app_config(request):
+    """应用运行时配置（远端下发）：watch 实时推送开关与阈值。
+
+    前端 loadRemote 时读取，据此决定启用 watch 实时推送还是退回轮询；
+    管理员通过 CloudBase 控制台 / MCP 修改 app_config 集合的 default 文档即可
+    动态切换，无需重新部署前后端。
+    """
+    try:
+        client = get_nosql_client()
+        doc = client.get_document(APP_CONFIG, "default")
+    except CloudBaseAPIError as exc:
+        if exc.status == 404:
+            doc = {}
+        else:
+            return _handle_cloudbase_error(exc)
+    data = doc if isinstance(doc, dict) else {}
+    return JsonResponse(
+        {
+            "ok": True,
+            "data": {
+                "watch_enabled": bool(data.get("watch_enabled", False)),
+                "watch_max_users": int(data.get("watch_max_users", 10)),
+            },
+        }
+    )
