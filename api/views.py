@@ -747,3 +747,25 @@ def apply_workcard(request, project_id):
         return _error(str(exc), 400)
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
         return _handle_cloudbase_error(exc)
+
+
+@require_http_methods(["GET"])
+def aircraft_numbers(request):
+    """公开返回飞机信息标准库的机号列表（仅机号，不含 FSN/MSN/发动机等敏感字段）。
+
+    机号（飞机注册号）是公开信息，供工作准备单/单项准备单的机号下拉模糊搜索使用；
+    敏感字段仍由 AIRNAV token 保护（standard_library 的 aircraft_info 读取鉴权不变）。
+    """
+    try:
+        client = get_nosql_client()
+        rows = _read_std_rows(client, AIRCRAFT_INFO)
+        numbers = sorted(
+            {
+                str(row.get("飞机号") or "").strip()
+                for row in rows
+                if str(row.get("飞机号") or "").strip()
+            }
+        )
+        return JsonResponse({"ok": True, "data": numbers})
+    except (CloudBaseConfigError, CloudBaseAPIError) as exc:
+        return _handle_cloudbase_error(exc)
