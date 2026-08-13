@@ -12,6 +12,7 @@ urlpatterns = [
     path("api/poll/", views.poll),
     path("api/projects/", views.projects),
     path("api/projects/<str:project_id>/", views.project_detail),
+    path("api/projects/<str:project_id>/apply-workcard/", views.apply_workcard),
     path("api/templates/<str:aircraft_type>/", views.aircraft_template),
     path("api/material-templates/<str:aircraft_type>/", views.material_template),
     path("api/tool-cart/", views.tool_cart),

@@ -23,6 +23,13 @@ from .cloudbase_nosql import (
     CloudBaseNoSQLClient,
 )
 from .polling import PollingPayloadError
+from .workcard_filter import (
+    apply_material_filter,
+    apply_tool_filter,
+    apply_work_card_list,
+    collect_apu_workcard_names,
+    collect_workcard_names,
+)
 
 
 # 本地开发可通过前缀使用独立测试集合；生产环境保持空前缀。
@@ -629,3 +636,111 @@ def app_config(request):
             },
         }
     )
+
+
+def _read_std_rows(client: CloudBaseNoSQLClient, collection: str) -> list:
+    """读标准库文档（rows 数组，doc_id="default"）。"""
+    try:
+        doc = client.get_document(collection, "default")
+    except CloudBaseAPIError as exc:
+        if exc.status == 404:
+            return []
+        raise
+    rows = doc.get("rows") if isinstance(doc, dict) else None
+    return rows if isinstance(rows, list) else []
+
+
+def _read_std_sections(client: CloudBaseNoSQLClient, collection: str, doc_id: str) -> list:
+    """读标准库文档（sections 数组）。"""
+    try:
+        doc = client.get_document(collection, doc_id)
+    except CloudBaseAPIError as exc:
+        if exc.status == 404:
+            return []
+        raise
+    sections = doc.get("sections") if isinstance(doc, dict) else None
+    return sections if isinstance(sections, list) else []
+
+
+@require_http_methods(["POST"])
+def apply_workcard(request, project_id):
+    """依据工卡清单：后端计算工卡分配 + 工具/航材清单自动筛选，直接写入云端。
+
+    两种模式（同一端点）：
+    - 完整模式：body 带 cards（xlsx 解析结果）→ 工卡分配 + 工具/航材筛选；
+    - 筛选模式：body 不带 cards → 仅用项目已有 workcard_assignment 做工具/航材筛选
+      （对应前端手动「按卡筛选」按钮）。
+
+    写入后 _bump_revision 触发其它端同步，前端 loadRemote 显示权威结果。
+    """
+    try:
+        client = get_nosql_client()
+        body = _json_body(request)
+
+        project_doc = client.get_document(PROJECTS, project_id)
+        if not isinstance(project_doc, dict):
+            return _error("项目不存在", 404)
+
+        aircraft_type = str(body.get("aircraft_type") or project_doc.get("aircraft_type") or "A320").upper()
+        if aircraft_type not in AIRCRAFT_TYPES:
+            aircraft_type = "A320"
+
+        cards = body.get("cards")
+        full_mode = isinstance(cards, list) and len(cards) > 0
+        if full_mode:
+            workcard_rows = _read_std_rows(client, WORKCARD_320)
+            aircraft_rows = _read_std_rows(client, AIRCRAFT_INFO)
+            # 1) 工卡分配
+            prep_sheet, assignment, written = apply_work_card_list(
+                project_doc, workcard_rows, aircraft_rows, body
+            )
+        else:
+            written = 0
+            prep_sheet = project_doc.get("prep_sheet") if isinstance(project_doc.get("prep_sheet"), dict) else {}
+            assignment = project_doc.get("workcard_assignment") if isinstance(project_doc.get("workcard_assignment"), dict) else {}
+
+        tool_lib = _read_std_sections(client, TEMPLATES, aircraft_type)
+        material_lib = _read_std_sections(client, MATERIAL_TEMPLATES, aircraft_type)
+        names = collect_workcard_names(assignment)
+        apu_names = collect_apu_workcard_names(assignment)
+        engine = str((prep_sheet.get("base") or {}).get("发动机", ""))
+
+        # 2) 工具清单筛选（data → sections）
+        project_sections = project_doc.get("sections") if isinstance(project_doc.get("sections"), list) else []
+        tool_sections, tool_deleted, tool_added = apply_tool_filter(
+            project_sections, tool_lib, names, apu_names, engine
+        )
+
+        # 3) 航材清单筛选（material_list → sections）
+        material_sections = project_doc.get("material_list") if isinstance(project_doc.get("material_list"), list) else []
+        material_sections, mat_deleted, mat_added = apply_material_filter(
+            material_sections, material_lib, names, apu_names, engine
+        )
+
+        updates = {
+            "sections": tool_sections,
+            "material_list": material_sections,
+            "updated_at": _now(),
+        }
+        if full_mode:
+            updates["prep_sheet"] = prep_sheet
+            updates["workcard_assignment"] = assignment
+        client.update_document(PROJECTS, project_id, {"$set": updates, "$inc": {"version": 1}})
+        _bump_revision(client)
+
+        return JsonResponse(
+            {
+                "ok": True,
+                "data": {
+                    "written": written,
+                    "tool_deleted": tool_deleted,
+                    "tool_added": tool_added,
+                    "material_deleted": mat_deleted,
+                    "material_added": mat_added,
+                },
+            }
+        )
+    except ValueError as exc:
+        return _error(str(exc), 400)
+    except (CloudBaseConfigError, CloudBaseAPIError) as exc:
+        return _handle_cloudbase_error(exc)
