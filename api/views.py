@@ -94,12 +94,16 @@ def _bump_revision(client: CloudBaseNoSQLClient) -> None:
     """递增单计数器文档 seq，作为全局单调递增的 revision 来源。
 
     每次写操作成功后调用。计数器文档尚不存在时自动创建（seq=1）。
+    变更日志失败不影响主写入（最坏情况 poll 检测不到该次变更，退化为手动刷新）。
     """
-    result = client.update_document(
-        CHANGE_LOG, REVISION_DOC_ID, {"$inc": {"seq": 1}}, upsert=False
-    )
-    if isinstance(result, dict) and result.get("matched") == 0:
-        client.insert_document(CHANGE_LOG, {"_id": REVISION_DOC_ID, "seq": 1})
+    try:
+        result = client.update_document(
+            CHANGE_LOG, REVISION_DOC_ID, {"$inc": {"seq": 1}}, upsert=False
+        )
+        if isinstance(result, dict) and result.get("matched") == 0:
+            client.insert_document(CHANGE_LOG, {"_id": REVISION_DOC_ID, "seq": 1})
+    except (CloudBaseAPIError, CloudBaseConfigError):
+        pass
 
 
 def _read_revision(client: CloudBaseNoSQLClient) -> str:
