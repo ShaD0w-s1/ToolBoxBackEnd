@@ -4,6 +4,7 @@
 轮询修订计算集中在 polling，避免业务入口承担过多职责。
 """
 
+import base64
 import hashlib
 import hmac
 import json
@@ -22,6 +23,7 @@ from .cloudbase_nosql import (
     CloudBaseConfigError,
     CloudBaseNoSQLClient,
 )
+from .cloudbase_storage import CloudBaseStorageClient
 from .polling import PollingPayloadError
 from .workcard_filter import (
     apply_material_filter,
@@ -47,6 +49,8 @@ CHANGE_LOG = f"{COLLECTION_PREFIX}work_change_log"
 REVISION_DOC_ID = "revision"
 # 应用运行时配置（远端下发）：watch 实时推送开关与阈值。
 APP_CONFIG = f"{COLLECTION_PREFIX}app_config"
+# 现场管控单：按项目类型组织的云存储文件元数据（fileid 存这里，文件本体在云存储 COS）。
+CONTROL_DOCS = f"{COLLECTION_PREFIX}control_docs"
 AIRCRAFT_TYPES = {"A320", "B787"}
 
 # AIRNAV 短期授权 token 有效期（秒）。
@@ -767,5 +771,95 @@ def aircraft_numbers(request):
             }
         )
         return JsonResponse({"ok": True, "data": numbers})
+    except (CloudBaseConfigError, CloudBaseAPIError) as exc:
+        return _handle_cloudbase_error(exc)
+
+
+def _get_storage_client() -> CloudBaseStorageClient:
+    return CloudBaseStorageClient()
+
+
+@require_http_methods(["GET", "POST"])
+def control_docs(request):
+    """现场管控单列表 / 上传。
+
+    GET：返回全部现场管控单元数据（按项目类型组织）。
+    POST：上传现场管控单文件（body 含 base64 content），上传到云存储并记录 fileid。
+    """
+    try:
+        client = get_nosql_client()
+        if request.method == "GET":
+            result = client.list_documents(CONTROL_DOCS, limit=200)
+            docs = None
+            if isinstance(result, dict):
+                for key in ("list", "data", "documents", "items"):
+                    if isinstance(result.get(key), list):
+                        docs = result[key]
+                        break
+            return JsonResponse({"ok": True, "data": docs or []})
+
+        body = _json_body(request)
+        doc_type = str(body.get("type", "")).strip()
+        if not doc_type:
+            return _error("type 不能为空", 400)
+        if doc_type not in PROJECT_TYPES:
+            return _error("type 只支持 A检/零散/换发/换APU/单独项目", 400)
+        file_name = str(body.get("fileName", "")).strip()
+        content_b64 = str(body.get("content", "") or "")
+        if not file_name:
+            return _error("fileName 不能为空", 400)
+        if not content_b64:
+            return _error("content 不能为空", 400)
+        try:
+            file_bytes = base64.b64decode(content_b64)
+        except Exception:
+            return _error("content 不是合法的 base64", 400)
+
+        # 云存储路径：control-doc/<type>/<文件名>，同名覆盖（同一类型只保留最新一份）。
+        safe_name = file_name.replace("/", "_").replace("\\", "_")
+        object_id = f"control-doc/{doc_type}/{safe_name}"
+        storage = _get_storage_client()
+        cloud_object_id = storage.upload_bytes(object_id, file_bytes)
+
+        doc_id = uuid4().hex
+        document = {
+            "_id": doc_id,
+            "type": doc_type,
+            "fileName": file_name,
+            "cloudObjectId": cloud_object_id,
+            "uploadedAt": _now(),
+        }
+        client.insert_document(CONTROL_DOCS, document)
+        _bump_revision(client)
+        return JsonResponse({"ok": True, "data": document}, status=201)
+    except ValueError as exc:
+        return _error(str(exc), 400)
+    except (CloudBaseConfigError, CloudBaseAPIError) as exc:
+        return _handle_cloudbase_error(exc)
+
+
+@require_http_methods(["GET", "DELETE"])
+def control_doc_detail(request, doc_id):
+    """现场管控单详情：GET 返回下载链接，DELETE 删除文件与元数据。"""
+    try:
+        client = get_nosql_client()
+        doc = client.get_document(CONTROL_DOCS, doc_id)
+        if not isinstance(doc, dict) or not doc.get("_id"):
+            return _error("现场管控单不存在", 404)
+        if request.method == "DELETE":
+            cloud_id = doc.get("cloudObjectId")
+            if cloud_id:
+                try:
+                    _get_storage_client().delete_object(str(cloud_id))
+                except (CloudBaseConfigError, CloudBaseAPIError):
+                    pass  # 文件删除失败不阻断元数据删除
+            client.delete_document(CONTROL_DOCS, doc_id)
+            _bump_revision(client)
+            return JsonResponse({"ok": True})
+        cloud_id = doc.get("cloudObjectId")
+        if not cloud_id:
+            return _error("该记录缺少 fileid", 400)
+        url = _get_storage_client().get_download_url(str(cloud_id))
+        return JsonResponse({"ok": True, "data": {"downloadUrl": url, "fileName": doc.get("fileName", "")}})
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
         return _handle_cloudbase_error(exc)

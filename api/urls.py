@@ -20,4 +20,6 @@ urlpatterns = [
     path("api/standard-libraries/<str:lib_key>/", views.standard_library),
     path("api/config/", views.app_config),
     path("api/aircraft-numbers/", views.aircraft_numbers),
+    path("api/control-docs/", views.control_docs),
+    path("api/control-docs/<str:doc_id>/", views.control_doc_detail),
 ]
