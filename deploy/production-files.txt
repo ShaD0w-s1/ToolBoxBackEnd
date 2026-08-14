@@ -1,7 +1,7 @@
 # CloudBase HTTP 云函数生产包允许包含的精确文件清单。
 api/__init__.py
 api/cloudbase_nosql.py
-api/ninja_api.py
+api/cloudbase_storage.py
 api/polling.py
 api/urls.py
 api/views.py
