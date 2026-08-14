@@ -667,6 +667,22 @@ def _read_std_sections(client: CloudBaseNoSQLClient, collection: str, doc_id: st
     return sections if isinstance(sections, list) else []
 
 
+def _infer_aircraft_type(aircraft_rows: list, reg_no: str) -> str:
+    """从飞机信息标准库按机号推断机型：含 787 → B787，含 320/321 → A320，无 → ""。"""
+    target = (reg_no or "").strip()
+    if not target:
+        return ""
+    for row in aircraft_rows:
+        if (row.get("飞机号") or "").strip() == target:
+            model = str(row.get("机型") or "").upper()
+            if "787" in model:
+                return "B787"
+            if "320" in model or "321" in model:
+                return "A320"
+            break
+    return ""
+
+
 @require_http_methods(["POST"])
 def apply_workcard(request, project_id):
     """依据工卡清单：后端计算工卡分配 + 工具/航材清单自动筛选，直接写入云端。
@@ -686,16 +702,25 @@ def apply_workcard(request, project_id):
         if not isinstance(project_doc, dict):
             return _error("项目不存在", 404)
 
-        aircraft_type = str(body.get("aircraft_type") or project_doc.get("aircraft_type") or "A320").upper()
+        cards = body.get("cards")
+        full_mode = isinstance(cards, list) and len(cards) > 0
+        aircraft_rows: list = []
+        if full_mode:
+            aircraft_rows = _read_std_rows(client, AIRCRAFT_INFO)
+
+        # 确定机型：body 优先 → 机号推断（查飞机信息标准库）→ 项目字段 → A320。
+        # 机号推断必须在标准库比对之前完成，否则导入工卡（787 机号）会用默认 A320 比对。
+        aircraft_type = str(body.get("aircraft_type") or "").upper()
+        if aircraft_type not in AIRCRAFT_TYPES:
+            aircraft_type = _infer_aircraft_type(aircraft_rows, str(body.get("机号") or ""))
+        if aircraft_type not in AIRCRAFT_TYPES:
+            aircraft_type = str(project_doc.get("aircraft_type") or "A320").upper()
         if aircraft_type not in AIRCRAFT_TYPES:
             aircraft_type = "A320"
 
-        cards = body.get("cards")
-        full_mode = isinstance(cards, list) and len(cards) > 0
         if full_mode:
             workcard_rows = _read_std_rows(client, WORKCARD_320)
-            aircraft_rows = _read_std_rows(client, AIRCRAFT_INFO)
-            # 1) 工卡分配
+            # 1) 工卡分配（复用 aircraft_rows）
             prep_sheet, assignment, written = apply_work_card_list(
                 project_doc, workcard_rows, aircraft_rows, body
             )
