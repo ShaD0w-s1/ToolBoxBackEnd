@@ -765,6 +765,7 @@ def apply_workcard(request, project_id):
                 "ok": True,
                 "data": {
                     "written": written,
+                    "aircraft_type": aircraft_type,
                     "tool_deleted": tool_deleted,
                     "tool_added": tool_added,
                     "material_deleted": mat_deleted,
