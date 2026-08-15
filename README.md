@@ -124,22 +124,6 @@ Git 仓库只保存无密钥的代码和配置模板；API Key、微信密钥等
 首次使用新名称部署时，脚本允许把原来指向 `dtlapi` 的 `/api` 路由切换到
 `toolbox-api`。旧函数会保留作为人工回退点，不会被部署脚本自动删除。
 
-## GitHub Actions
-
-`.github/workflows/ci-cd.yml` 会在 `main`、`develop` 的推送和 PR 上执行 Django
-检查与测试；只有 `main` 推送或从 `main` 手动运行时才会部署生产 API。请在 GitHub
-仓库的 `production` Environment 中配置以下 Secrets：
-
-- `TCB_SECRET_ID`：腾讯云 CAM SecretId
-- `TCB_SECRET_KEY`：腾讯云 CAM SecretKey
-- `TCB_ENV_ID`：CloudBase 环境 ID
-- `CLOUDBASE_API_KEY`：后端访问 CloudBase NoSQL 的服务端 API Key
-- `DJANGO_PRODUCTION_SECRET_KEY`：稳定的 Django 生产密钥，后续不要更换
-
-可选配置 Environment Variable `CSRF_TRUSTED_ORIGINS`，值为逗号分隔的 HTTPS
-Origin；不配置时继续使用脚本内现有的生产域名。建议给 `production` Environment
-启用 required reviewers，并为 `main` 启用分支保护，要求 CI 通过后才能合并。
-
 脚本会自动完成：
 
 1. 从 `main` 生成确定性的生产包；

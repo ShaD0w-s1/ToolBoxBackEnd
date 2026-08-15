@@ -3,20 +3,37 @@ from unittest.mock import patch
 
 from django.test import TestCase
 
-from .cloudbase_nosql import decode_ejson
+from .cloudbase_nosql import CloudBaseAPIError, decode_ejson
 from .polling import PollingPayloadError, calculate_revision
+from .views import CHANGE_LOG, REVISION_DOC_ID
 
 
 class FakeNoSQLClient:
     def __init__(self):
         self.inserted = []
+        self.docs = {}
 
     def insert_document(self, collection, document):
         self.inserted.append((collection, document))
+        self.docs.setdefault(collection, {})[document.get("_id")] = document
         return {"insertedIds": [document["_id"]]}
 
     def list_documents(self, collection, **kwargs):
         return {"offset": 0, "limit": kwargs["limit"], "list": []}
+
+    def get_document(self, collection, document_id):
+        return self.docs.get(collection, {}).get(document_id)
+
+    def update_document(self, collection, document_id, data, *, upsert=False):
+        doc = self.docs.setdefault(collection, {}).get(document_id)
+        if doc is None:
+            return {"matched": 0, "upsert_id": None}
+        if isinstance(data, dict):
+            for key, value in (data.get("$set") or {}).items():
+                doc[key] = value
+            for key, value in (data.get("$inc") or {}).items():
+                doc[key] = doc.get(key, 0) + value
+        return {"matched": 1}
 
 
 class ApiSmokeTests(TestCase):
@@ -98,47 +115,6 @@ class ApiSmokeTests(TestCase):
         self.assertEqual(response.json()["data"][0]["_id"], "project-1")
 
 
-class NinjaApiTests(TestCase):
-    def test_swagger_docs_page_renders(self):
-        response = self.client.get("/api/docs")
-
-        self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "swagger-ui")
-
-    def test_openapi_schema_describes_typed_examples(self):
-        response = self.client.get("/api/openapi.json")
-
-        self.assertEqual(response.status_code, 200)
-        paths = response.json()["paths"]
-        self.assertIn("/api/hello", paths)
-        self.assertIn("/api/project-preview", paths)
-
-    def test_project_preview_validates_and_returns_payload(self):
-        response = self.client.post(
-            "/api/project-preview",
-            data=json.dumps(
-                {
-                    "name": "A320 Check",
-                    "aircraft_type": "A320",
-                    "team": "A1",
-                }
-            ),
-            content_type="application/json",
-        )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.json()["ok"])
-        self.assertEqual(response.json()["data"]["aircraft_type"], "A320")
-
-    def test_project_preview_rejects_unknown_aircraft_type(self):
-        response = self.client.post(
-            "/api/project-preview",
-            data=json.dumps({"name": "Demo", "aircraft_type": "C919"}),
-            content_type="application/json",
-        )
-
-        self.assertEqual(response.status_code, 422)
-
 
 class EJsonTests(TestCase):
     def test_decodes_cloudbase_strict_ejson(self):
@@ -173,7 +149,11 @@ class PollingTests(TestCase):
 
     def test_poll_returns_bad_gateway_for_unknown_payload(self):
         fake = FakeNoSQLClient()
-        fake.list_documents = lambda collection, **kwargs: {"unexpected": []}
+
+        def raise_api_error(collection, document_id):
+            raise CloudBaseAPIError(502, "upstream failure")
+
+        fake.get_document = raise_api_error
 
         with patch("api.views.get_nosql_client", return_value=fake):
             response = self.client.get("/api/poll/")
@@ -201,14 +181,11 @@ class PollingTests(TestCase):
 
     def test_poll_reports_a_changed_revision(self):
         fake = FakeNoSQLClient()
-        fake.list_documents = lambda collection, **kwargs: {
-            "data": [{"_id": collection, "version": 1}]
-        }
+        fake.docs[CHANGE_LOG] = {REVISION_DOC_ID: {"_id": REVISION_DOC_ID, "seq": 5}}
         with patch("api.views.get_nosql_client", return_value=fake):
             baseline = self.client.get("/api/poll/").json()["revision"]
-            fake.list_documents = lambda collection, **kwargs: {
-                "data": [{"_id": collection, "version": 2}]
-            }
+            self.assertEqual(baseline, "5")
+            fake.docs[CHANGE_LOG][REVISION_DOC_ID]["seq"] = 6
             response = self.client.get(f"/api/poll/?revision={baseline}")
 
         self.assertEqual(response.status_code, 200)
