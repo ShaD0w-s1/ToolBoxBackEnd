@@ -20,6 +20,12 @@ urlpatterns = [
     path("api/standard-libraries/<str:lib_key>/", views.standard_library),
     path("api/config/", views.app_config),
     path("api/aircraft-numbers/", views.aircraft_numbers),
+    path("api/aircraft-info/", views.aircraft_info),
     path("api/control-docs/", views.control_docs),
     path("api/control-docs/<str:doc_id>/", views.control_doc_detail),
+    path("api/identity/", views.identity),
+    path("api/identity/accounts/", views.accounts),
+    path("api/eng-templates/", views.eng_templates),
+    path("api/eng-templates/<str:template_id>/duplicate/", views.eng_template_duplicate),
+    path("api/eng-templates/<str:template_id>/", views.eng_template_detail),
 ]
