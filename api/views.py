@@ -55,6 +55,8 @@ CONTROL_DOCS = f"{COLLECTION_PREFIX}control_docs"
 ACCOUNTS = f"{COLLECTION_PREFIX}work_accounts"
 # 换发/APU 模板库：每模板一文档，_id 用 uuid，字段 = { id, name, savedAt, state }（state 即 GanttPrep 全量）。
 ENG_TEMPLATES = f"{COLLECTION_PREFIX}eng_templates"
+# 单项工作模板库（单独项目）：每模板一文档，字段 = { id, name, savedAt, state }（state 即 StandalonePrepSheet，不含 base）。
+STANDALONE_TEMPLATES = f"{COLLECTION_PREFIX}standalone_templates"
 AIRCRAFT_TYPES = {"A320", "B787"}
 
 # AIRNAV 短期授权 token 有效期（秒）。
@@ -1144,6 +1146,102 @@ def eng_template_duplicate(request, template_id):
             "state": doc.get("state", {}),
         }
         client.insert_document(ENG_TEMPLATES, new_doc)
+        _bump_revision(client)
+        return JsonResponse({"ok": True, "data": new_doc}, status=201)
+    except (CloudBaseConfigError, CloudBaseAPIError) as exc:
+        return _handle_cloudbase_error(exc)
+
+
+def standalone_templates(request):
+    """单项工作模板库：模板列表（公开）/ 新建模板。
+
+    每模板一文档（_id = uuid），字段 = { id, name, savedAt, state }，
+    state 即 StandalonePrepSheet（不含 base，base 属项目特有信息）。
+    """
+    client = get_nosql_client()
+    if request.method == "GET":
+        try:
+            result = client.list_documents(STANDALONE_TEMPLATES, limit=200)
+            docs = None
+            if isinstance(result, dict):
+                for key in ("list", "data", "documents", "items"):
+                    if isinstance(result.get(key), list):
+                        docs = result[key]
+                        break
+            return JsonResponse({"ok": True, "data": docs or []})
+        except (CloudBaseConfigError, CloudBaseAPIError) as exc:
+            return _handle_cloudbase_error(exc)
+
+    try:
+        body = _json_body(request)
+    except ValueError as exc:
+        return _error(str(exc), 400)
+    name = str(body.get("name", "")).strip()
+    if not name:
+        return _error("name 不能为空", 400)
+    state = body.get("state")
+    if not isinstance(state, dict):
+        return _error("state 必须是对象", 400)
+    now = _now()
+    doc_id = uuid4().hex
+    document = {"_id": doc_id, "id": doc_id, "name": name, "savedAt": now, "state": state}
+    try:
+        client.insert_document(STANDALONE_TEMPLATES, document)
+        _bump_revision(client)
+        return JsonResponse({"ok": True, "data": document}, status=201)
+    except (CloudBaseConfigError, CloudBaseAPIError) as exc:
+        return _handle_cloudbase_error(exc)
+
+
+@require_http_methods(["GET", "PUT", "DELETE"])
+def standalone_template_detail(request, template_id):
+    """模板详情 / 整体替换（name + state）/ 删除。"""
+    client = get_nosql_client()
+    try:
+        if request.method == "GET":
+            return JsonResponse({"ok": True, "data": client.get_document(STANDALONE_TEMPLATES, template_id)})
+        if request.method == "DELETE":
+            client.delete_document(STANDALONE_TEMPLATES, template_id)
+            _bump_revision(client)
+            return JsonResponse({"ok": True})
+        body = _json_body(request)
+        name = str(body.get("name", "")).strip()
+        state = body.get("state")
+        if not name:
+            return _error("name 不能为空", 400)
+        if not isinstance(state, dict):
+            return _error("state 必须是对象", 400)
+        client.update_document(
+            STANDALONE_TEMPLATES,
+            template_id,
+            {"$set": {"name": name, "state": state, "savedAt": _now()}},
+            upsert=True,
+        )
+        _bump_revision(client)
+        return JsonResponse({"ok": True})
+    except ValueError as exc:
+        return _error(str(exc), 400)
+    except (CloudBaseConfigError, CloudBaseAPIError) as exc:
+        return _handle_cloudbase_error(exc)
+
+
+@require_http_methods(["POST"])
+def standalone_template_duplicate(request, template_id):
+    """复制模板：新 uuid + 名称后缀「副本」。"""
+    client = get_nosql_client()
+    try:
+        doc = client.get_document(STANDALONE_TEMPLATES, template_id)
+        if not isinstance(doc, dict) or not doc.get("name"):
+            return _error("模板不存在", 404)
+        new_id = uuid4().hex
+        new_doc = {
+            "_id": new_id,
+            "id": new_id,
+            "name": f"{doc.get('name')} 副本",
+            "savedAt": _now(),
+            "state": doc.get("state", {}),
+        }
+        client.insert_document(STANDALONE_TEMPLATES, new_doc)
         _bump_revision(client)
         return JsonResponse({"ok": True, "data": new_doc}, status=201)
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:

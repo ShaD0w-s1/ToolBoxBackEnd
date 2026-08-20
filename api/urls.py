@@ -28,4 +28,7 @@ urlpatterns = [
     path("api/eng-templates/", views.eng_templates),
     path("api/eng-templates/<str:template_id>/duplicate/", views.eng_template_duplicate),
     path("api/eng-templates/<str:template_id>/", views.eng_template_detail),
+    path("api/standalone-templates/", views.standalone_templates),
+    path("api/standalone-templates/<str:template_id>/duplicate/", views.standalone_template_duplicate),
+    path("api/standalone-templates/<str:template_id>/", views.standalone_template_detail),
 ]
