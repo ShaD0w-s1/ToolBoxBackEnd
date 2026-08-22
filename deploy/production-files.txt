@@ -5,6 +5,7 @@ api/cloudbase_storage.py
 api/polling.py
 api/urls.py
 api/views.py
+api/workcard_filter.py
 cloudrun/__init__.py
 cloudrun/settings_scf.py
 cloudrun/urls.py

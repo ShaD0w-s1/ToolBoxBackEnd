@@ -77,6 +77,24 @@ function Get-CloudBaseMcpCli {
     throw "CloudBase MCP CLI not found. Run 'npx --yes @cloudbase/cloudbase-mcp@latest --help' once, or set CLOUDBASE_MCP_CLI."
 }
 
+function Read-McpResponse {
+    # 新版 cloudbase-mcp 的 JSONRPC 消息中 text 字段可能含真实换行（跨多行输出），
+    # 逐行累积直到能解析出合法 JSON，避免 ReadLine 只读第一行导致 ConvertFrom-Json 失败。
+    $sb = [System.Text.StringBuilder]::new()
+    while ($true) {
+        $line = $script:mcpProcess.StandardOutput.ReadLine()
+        if ($null -eq $line) { break }
+        [void]$sb.AppendLine($line)
+        $candidate = $sb.ToString()
+        try {
+            return $candidate | ConvertFrom-Json
+        } catch {
+            # 消息未完整，继续累积读取
+        }
+    }
+    return $null
+}
+
 function Start-Mcp([string]$CliPath) {
     # MCP 使用标准输入输出上的 JSON-RPC；不经过交互式 Shell，避免参数注入。
     $node = (Get-Command node.exe -ErrorAction Stop).Source
@@ -106,7 +124,7 @@ function Start-Mcp([string]$CliPath) {
     } | ConvertTo-Json -Compress -Depth 10
     $script:mcpProcess.StandardInput.WriteLine($initialize)
     $script:mcpProcess.StandardInput.Flush()
-    $response = $script:mcpProcess.StandardOutput.ReadLine() | ConvertFrom-Json
+    $response = Read-McpResponse
     if (-not $response.result) {
         throw "CloudBase MCP initialization failed"
     }
@@ -128,7 +146,7 @@ function Invoke-McpTool([string]$Name, [hashtable]$Arguments) {
     } | ConvertTo-Json -Compress -Depth 30
     $script:mcpProcess.StandardInput.WriteLine($request)
     $script:mcpProcess.StandardInput.Flush()
-    $response = $script:mcpProcess.StandardOutput.ReadLine() | ConvertFrom-Json
+    $response = Read-McpResponse
     if (-not $response.result.content -or -not $response.result.content[0].text) {
         throw "CloudBase MCP returned an invalid response for $Name"
     }
