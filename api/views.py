@@ -1055,6 +1055,36 @@ def accounts(request):
         return _handle_cloudbase_error(exc)
 
 
+@require_http_methods(["GET"])
+def online_count(request):
+    """统计网站同时在线人数：work_accounts 中 last_seen 距今 ≤ 5 分钟的账号数（免鉴权，供页面徽标轮询）。
+
+    前端每 60 秒 POST /api/identity/ 心跳保活 last_seen，本端点按 5 分钟窗口聚合。
+    """
+    client = get_nosql_client()
+    try:
+        result = client.list_documents(ACCOUNTS, limit=500)
+        docs = result.get("data") if isinstance(result, dict) else None
+        now = datetime.now(timezone.utc)
+        count = 0
+        if isinstance(docs, list):
+            for d in docs:
+                if not isinstance(d, dict) or not d.get("name"):
+                    continue
+                last_seen = str(d.get("last_seen") or "")
+                try:
+                    ts = datetime.fromisoformat(last_seen)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    if (now - ts).total_seconds() <= 300:  # 5 分钟在线窗口
+                        count += 1
+                except ValueError:
+                    continue
+        return JsonResponse({"ok": True, "data": {"count": count}})
+    except (CloudBaseConfigError, CloudBaseAPIError) as exc:
+        return _handle_cloudbase_error(exc)
+
+
 @require_http_methods(["GET", "POST"])
 def eng_templates(request):
     """换发/APU 模板库：模板列表（公开）/ 新建模板。

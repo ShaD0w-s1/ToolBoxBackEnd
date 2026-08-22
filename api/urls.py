@@ -25,6 +25,7 @@ urlpatterns = [
     path("api/control-docs/<str:doc_id>/", views.control_doc_detail),
     path("api/identity/", views.identity),
     path("api/identity/accounts/", views.accounts),
+    path("api/online-count/", views.online_count),
     path("api/eng-templates/", views.eng_templates),
     path("api/eng-templates/<str:template_id>/duplicate/", views.eng_template_duplicate),
     path("api/eng-templates/<str:template_id>/", views.eng_template_detail),
