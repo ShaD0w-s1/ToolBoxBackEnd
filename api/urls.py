@@ -26,6 +26,7 @@ urlpatterns = [
     path("api/identity/", views.identity),
     path("api/identity/accounts/", views.accounts),
     path("api/online-count/", views.online_count),
+    path("api/editing/", views.editing),
     path("api/eng-templates/", views.eng_templates),
     path("api/eng-templates/<str:template_id>/duplicate/", views.eng_template_duplicate),
     path("api/eng-templates/<str:template_id>/", views.eng_template_detail),

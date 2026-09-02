@@ -53,6 +53,13 @@ APP_CONFIG = f"{COLLECTION_PREFIX}app_config"
 CONTROL_DOCS = f"{COLLECTION_PREFIX}control_docs"
 # 登录过的账号目录（无密码身份标识）：每账号一文档，doc_id = 姓名（2-5 字符）。
 ACCOUNTS = f"{COLLECTION_PREFIX}work_accounts"
+# 编辑会话（字段/输入框软锁）：与账号目录共用集合，doc_id = "editing:" + session_id，doc_type="editing"，
+# 避免新增集合（CloudBase NoSQL 集合需显式建表）；accounts / online-count 必须按 doc_type 过滤。
+# 字段 = { doc_type, name, session_id, project_id, key, at }；TTL 由查询端懒过滤（at 距今 > 60s 视为已释放）。
+EDIT_SESSION_TTL_SECONDS = 60
+# 编辑会话（单输入框软锁）：与账号目录同集合，doc_id = "editing:" + session_id，doc_type="editing"，
+# 避免新增集合（CloudBase NoSQL 需显式建表）；accounts/online_count 需按 doc_type 过滤避免污染目录。
+# 字段 = { doc_type, name, project_id, key, at }，key 为空串视为已释放。
 # 换发/APU 模板库：每模板一文档，_id 用 uuid，字段 = { id, name, savedAt, state }（state 即 GanttPrep 全量）。
 ENG_TEMPLATES = f"{COLLECTION_PREFIX}eng_templates"
 # 单项工作模板库（单独项目）：每模板一文档，字段 = { id, name, savedAt, state }（state 即 StandalonePrepSheet，不含 base）。
@@ -1040,7 +1047,7 @@ def accounts(request):
         accounts: list[dict] = []
         if isinstance(docs, list):
             for d in docs:
-                if isinstance(d, dict) and d.get("name"):
+                if isinstance(d, dict) and d.get("name") and d.get("doc_type") != "editing":
                     accounts.append(
                         {
                             "name": str(d.get("name")),
@@ -1069,7 +1076,7 @@ def online_count(request):
         count = 0
         if isinstance(docs, list):
             for d in docs:
-                if not isinstance(d, dict) or not d.get("name"):
+                if not isinstance(d, dict) or not d.get("name") or d.get("doc_type") == "editing":
                     continue
                 last_seen = str(d.get("last_seen") or "")
                 try:
@@ -1083,6 +1090,114 @@ def online_count(request):
         return JsonResponse({"ok": True, "data": {"count": count}})
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
         return _handle_cloudbase_error(exc)
+
+
+@require_http_methods(["GET", "POST"])
+def editing(request):
+    """字段/输入框级编辑会话（软锁，协作约束非安全层）。
+
+    POST 上报当前正在编辑的字段：{ session_id, name, project_id, key }
+      - key 非空：心跳保活（每 ~15s 上报一次），upsert doc_id="editing:"+session_id；
+      - key 为空串：主动释放（更新 at 为过去时间，等价删除语义）。
+    GET ?project_id=xxx 返回最近 EDIT_SESSION_TTL_SECONDS 秒内活跃的其他用户编辑会话
+      [{ session_id, name, key }]（排除自己的 session_id），供对方渲染「某人正在编辑」黄锁。
+
+    免登录无鉴权：锁是协作约束，不是安全层；不校验身份真伪。
+    """
+    client = get_nosql_client()
+    if request.method == "POST":
+        try:
+            body = _json_body(request)
+        except ValueError as exc:
+            return _error(str(exc), 400)
+        session_id = str(body.get("session_id", "")).strip()
+        name = str(body.get("name", "")).strip()
+        project_id = str(body.get("project_id", "")).strip()
+        key = str(body.get("key", "")).strip()
+        if not session_id or len(session_id) > 64:
+            return _error("session_id 缺失或过长", 400)
+        if key:
+            if not (2 <= len(name) <= 5):
+                return _error("姓名需为 2-5 个字符", 400)
+            if not project_id or len(project_id) > 64:
+                return _error("project_id 缺失或过长", 400)
+            if len(key) > 200:
+                return _error("key 过长", 400)
+            doc_id = f"editing:{session_id}"
+            try:
+                client.update_document(
+                    ACCOUNTS,
+                    doc_id,
+                    {
+                        "$set": {
+                            "doc_type": "editing",
+                            "session_id": session_id,
+                            "name": name,
+                            "project_id": project_id,
+                            "key": key,
+                            "at": _now(),
+                        }
+                    },
+                    upsert=True,
+                )
+            except (CloudBaseConfigError, CloudBaseAPIError) as exc:
+                return _handle_cloudbase_error(exc)
+        else:
+            # 主动释放：把 at 推到过去，避免残留（查询端按 TTL 懒过滤兜底）。
+            try:
+                client.update_document(
+                    ACCOUNTS,
+                    f"editing:{session_id}",
+                    {"$set": {"key": "", "at": "1970-01-01T00:00:00+00:00"}},
+                    upsert=False,
+                )
+            except (CloudBaseConfigError, CloudBaseAPIError):
+                pass  # 文档不存在视为已释放
+        return JsonResponse({"ok": True})
+
+    project_id = request.GET.get("project_id", "").strip()
+    if not project_id:
+        return _error("project_id 缺失", 400)
+    exclude_session = request.GET.get("session_id", "").strip()
+    try:
+        result = client.list_documents(ACCOUNTS, limit=1000)
+    except (CloudBaseConfigError, CloudBaseAPIError) as exc:
+        return _handle_cloudbase_error(exc)
+    docs = None
+    if isinstance(result, dict):
+        for key in ("list", "data", "documents", "items"):
+            if isinstance(result.get(key), list):
+                docs = result[key]
+                break
+    now = datetime.now(timezone.utc)
+    active: list[dict] = []
+    if isinstance(docs, list):
+        for d in docs:
+            if not isinstance(d, dict) or d.get("doc_type") != "editing":
+                continue
+            sid = str(d.get("session_id") or "")
+            key = str(d.get("key") or "").strip()
+            if not sid or not key or sid == exclude_session:
+                continue
+            if str(d.get("project_id") or "") != project_id:
+                continue
+            at = str(d.get("at") or "")
+            try:
+                ts = datetime.fromisoformat(at)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if (now - ts).total_seconds() > EDIT_SESSION_TTL_SECONDS:
+                    continue
+            except ValueError:
+                continue
+            active.append(
+                {
+                    "session_id": sid,
+                    "name": str(d.get("name") or ""),
+                    "key": key,
+                }
+            )
+    return JsonResponse({"ok": True, "data": active})
 
 
 @require_http_methods(["GET", "POST"])
