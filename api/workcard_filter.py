@@ -234,6 +234,16 @@ def apply_work_card_list(project_doc: dict, workcard_rows: list, aircraft_rows: 
         sections[sec] = entry
     assignment["unassigned"] = []
 
+    # 临时分组（非标准键，前端「+ 临时分组」自建）：再次导入例行工卡清单时原样保留；
+    # 若其中的工卡本次清单再次包含，则继续保留在临时分组、不再重复写入标准分组（自动清理重复卡）。
+    temp_members = set()
+    for sec_key, entry in sections.items():
+        if sec_key not in WORKCARD_SECTIONS:
+            for row in entry.get("cards") or []:
+                wid = str(row.get("工卡号") or "").strip()
+                if wid:
+                    temp_members.add(wid)
+
     written = 0
     for card in parsed.get("cards", []):
         wid = (card.get("工卡号") or "").strip()
@@ -251,6 +261,8 @@ def apply_work_card_list(project_doc: dict, workcard_rows: list, aircraft_rows: 
             "必检": "",
             "部位": info["area"],
         }
+        if wid in temp_members:
+            continue  # 已归入临时分组：保留分组归属，避免与标准分组重复
         section = SECTION_BY_AREA.get(info["area"])
         if section:
             sections[section]["cards"].append(row)
