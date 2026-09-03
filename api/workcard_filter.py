@@ -23,7 +23,6 @@ AREA_BY_SECTION = {"FC": "FC", "LG": "LG", "ENG": "ENG", "AV CB": "AV"}
 WORKCARD_COLUMNS = ["序号", "工卡号", "工卡名称", "工卡分级", "参与人员", "工作签卡者", "必检"]
 KEEP_CATEGORIES = ["通用", "接机"]
 FIXED_MARK = "固定"
-MIN_MATCH_CHARS = 3
 EO_PREFIX_TRIGGERS = ("EOJC", "MCO", "NRC")
 # 工具筛选：完整引用部位（不受工卡匹配限制）；航材筛选仅「通用」。
 TOOL_KEEP_FULL = {"通用", "接机"}
@@ -48,46 +47,22 @@ def is_subsequence(needle: str, hay: str) -> bool:
     return i == len(needle)
 
 
-def shares_work_content(sub_name: str, work_contents: list) -> bool:
-    """航材类型名与任一工卡「工作内容」相关（3 命中规则，与前端 sharesWorkContent 对齐）。"""
-    name = (sub_name or "").strip()
-    if not name:
-        return False
-    n_norm = normalize_match(name)
-    if not n_norm:
-        return False
-    for content in work_contents:
-        c_norm = normalize_match(content)
-        if not c_norm:
-            continue
-        # 1) 名称整体被内容包含
-        if n_norm in c_norm:
-            return True
-        if len(n_norm) < MIN_MATCH_CHARS:
-            continue
-        # 2) 双向连续 MIN_MATCH_CHARS 字
-        gram_hit = False
-        for i in range(len(n_norm) - MIN_MATCH_CHARS + 1):
-            if n_norm[i:i + MIN_MATCH_CHARS] in c_norm:
-                gram_hit = True
-                break
-        if not gram_hit:
-            for i in range(len(c_norm) - MIN_MATCH_CHARS + 1):
-                if c_norm[i:i + MIN_MATCH_CHARS] in n_norm:
-                    gram_hit = True
-                    break
-        if gram_hit:
-            return True
-        # 3) 去连接词后子序列
-        if is_subsequence(strip_connectors(name), strip_connectors(content)):
-            return True
-    return False
-
-
 def shares_3_chars(name: str, names: list) -> bool:
-    """名称是否与任一工卡名称有 3 个连续相同字符（中文 > 英文 > 数字优先级）。"""
+    """名称是否与任一工卡名称命中（方案 B：保留 3 连续字主判据 + 2 字整名旁路）。
+
+    - 主判据（≥3 字）：3 连续字窗口分流——含中文 > 全英文 > 全数字（有中英则弃数字窗格，数字弱化保留）；
+    - 旁路（B 方案）：名称归一化后恰为 2 字（含中文/字母、纯数字不放行）且整名被任一工卡名
+      连续包含 → 命中（如「注油」「排故」整词出现在工卡内容中，原来 <3 字直接不匹配）。
+    """
     n = normalize_match(name)
+    if not n:
+        return False
     if len(n) < 3:
+        # B 方案旁路：仅 2 字整名连续包含；1 字名与纯数字 2 字名维持不匹配（弱化）
+        if len(n) == 2 and not re.fullmatch(r"[0-9]{2}", n):
+            for cn in names:
+                if n in normalize_match(cn):
+                    return True
         return False
     chinese_grams = []
     english_grams = []
