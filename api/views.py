@@ -987,6 +987,56 @@ def control_doc_detail(request, doc_id):
         return _handle_cloudbase_error(exc)
 
 
+# ============ 准备单附件（换发 / 单独项目「附件卡片」）============
+# 文件实体存云存储（object key = uuid hex，无斜杠）；元数据（名称/日期/fileKey）由前端写入项目/模板的
+# attachments 引用列表并随保存同步（模板保存/调取全量透传）。删除附件 = 前端移除引用（懒清理，对象共享）。
+PREP_ATTACH_MAX_B64 = 8 * 1024 * 1024  # base64 中转上限（SCF/网关约束）→ 单个文件建议 ≤5-6MB
+
+
+@require_http_methods(["POST"])
+def prep_attachment_upload(request):
+    """上传准备单附件：body { fileName, content(base64) } → 云存储对象，返回引用元数据。"""
+    try:
+        body = _json_body(request)
+    except ValueError as exc:
+        return _error(str(exc), 400)
+    file_name = str(body.get("fileName", "")).strip()
+    content_b64 = str(body.get("content", "") or "")
+    if not file_name:
+        return _error("fileName 不能为空", 400)
+    if not content_b64:
+        return _error("content 不能为空", 400)
+    if len(content_b64) > PREP_ATTACH_MAX_B64:
+        return _error("附件过大（base64 中转上限 8MB，单个文件约 ≤5-6MB）", 400)
+    try:
+        file_bytes = base64.b64decode(content_b64)
+    except Exception:
+        return _error("content 不是合法的 base64", 400)
+    if not file_bytes:
+        return _error("content 为空", 400)
+    file_key = uuid4().hex
+    storage = _get_storage_client()
+    storage.upload_bytes(file_key, file_bytes, content_type="application/octet-stream")
+    return JsonResponse(
+        {"ok": True, "data": {"fileKey": file_key, "name": file_name, "size": len(file_bytes), "uploadedAt": _now()}},
+        status=201,
+    )
+
+
+@require_http_methods(["GET", "DELETE"])
+def prep_attachment_detail(request, file_key):
+    """附件对象：GET 返回临时下载链接；DELETE 物理删除（懒清理/脚本用；前端「删除」仅移除引用）。"""
+    try:
+        storage = _get_storage_client()
+        if request.method == "DELETE":
+            storage.delete_object(file_key)
+            return JsonResponse({"ok": True})
+        url = storage.get_download_url(file_key)
+        return JsonResponse({"ok": True, "data": {"downloadUrl": url}})
+    except (CloudBaseConfigError, CloudBaseAPIError) as exc:
+        return _handle_cloudbase_error(exc)
+
+
 @require_http_methods(["POST"])
 def identity(request):
     """记录一次无密码身份登录（姓名 2-5 字符）。
