@@ -993,41 +993,48 @@ def control_doc_detail(request, doc_id):
 PREP_ATTACH_MAX_B64 = 8 * 1024 * 1024  # base64 中转上限（SCF/网关约束）→ 单个文件建议 ≤5-6MB
 
 
-@require_http_methods(["POST"])
-def prep_attachment_upload(request):
-    """上传准备单附件：body { fileName, content(base64) } → 云存储对象，返回引用元数据。"""
-    try:
-        body = _json_body(request)
-    except ValueError as exc:
-        return _error(str(exc), 400)
-    file_name = str(body.get("fileName", "")).strip()
-    content_b64 = str(body.get("content", "") or "")
-    if not file_name:
-        return _error("fileName 不能为空", 400)
-    if not content_b64:
-        return _error("content 不能为空", 400)
-    if len(content_b64) > PREP_ATTACH_MAX_B64:
-        return _error("附件过大（base64 中转上限 8MB，单个文件约 ≤5-6MB）", 400)
-    try:
-        file_bytes = base64.b64decode(content_b64)
-    except Exception:
-        return _error("content 不是合法的 base64", 400)
-    if not file_bytes:
-        return _error("content 为空", 400)
-    file_key = uuid4().hex
+@require_http_methods(["GET", "POST", "DELETE"])
+def prep_attachment_file(request):
+    """准备单附件对象（POST=上传 / GET=下载 URL / DELETE=物理删除）。
+
+    上传 body { fileName, content(base64) } → 云存储对象，返回 {fileKey(cloudObjectId),name,size,uploadedAt}；
+    引用归属由前端写入项目/模板 attachments 随保存同步。
+    GET/DELETE 用 query `file_key`（cloudObjectId 含 ://与 /，path 传参会被网关还原为段，故用 query）。
+    DELETE 为懒清理/脚本用；前端「删除」仅移除引用、不调用。
+    """
     storage = _get_storage_client()
-    cloud_object_id = storage.upload_bytes(file_key, file_bytes, content_type="application/octet-stream")
-    return JsonResponse(
-        {"ok": True, "data": {"fileKey": cloud_object_id, "name": file_name, "size": len(file_bytes), "uploadedAt": _now()}},
-        status=201,
-    )
-
-
-@require_http_methods(["GET", "DELETE"])
-def prep_attachment_detail(request, file_key):
-    """附件对象：GET 返回临时下载链接；DELETE 物理删除（懒清理/脚本用；前端「删除」仅移除引用）。"""
+    if request.method == "POST":
+        try:
+            body = _json_body(request)
+        except ValueError as exc:
+            return _error(str(exc), 400)
+        file_name = str(body.get("fileName", "")).strip()
+        content_b64 = str(body.get("content", "") or "")
+        if not file_name:
+            return _error("fileName 不能为空", 400)
+        if not content_b64:
+            return _error("content 不能为空", 400)
+        if len(content_b64) > PREP_ATTACH_MAX_B64:
+            return _error("附件过大（base64 中转上限 8MB，单个文件约 ≤5-6MB）", 400)
+        try:
+            file_bytes = base64.b64decode(content_b64)
+        except Exception:
+            return _error("content 不是合法的 base64", 400)
+        if not file_bytes:
+            return _error("content 为空", 400)
+        file_key = uuid4().hex
+        try:
+            cloud_object_id = storage.upload_bytes(file_key, file_bytes, content_type="application/octet-stream")
+        except (CloudBaseConfigError, CloudBaseAPIError) as exc:
+            return _handle_cloudbase_error(exc)
+        return JsonResponse(
+            {"ok": True, "data": {"fileKey": cloud_object_id, "name": file_name, "size": len(file_bytes), "uploadedAt": _now()}},
+            status=201,
+        )
+    file_key = request.GET.get("file_key", "").strip()
+    if not file_key:
+        return _error("file_key 缺失", 400)
     try:
-        storage = _get_storage_client()
         if request.method == "DELETE":
             storage.delete_object(file_key)
             return JsonResponse({"ok": True})
