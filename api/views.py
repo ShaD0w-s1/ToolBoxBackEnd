@@ -1016,9 +1016,9 @@ def prep_attachment_upload(request):
         return _error("content 为空", 400)
     file_key = uuid4().hex
     storage = _get_storage_client()
-    storage.upload_bytes(file_key, file_bytes, content_type="application/octet-stream")
+    cloud_object_id = storage.upload_bytes(file_key, file_bytes, content_type="application/octet-stream")
     return JsonResponse(
-        {"ok": True, "data": {"fileKey": file_key, "name": file_name, "size": len(file_bytes), "uploadedAt": _now()}},
+        {"ok": True, "data": {"fileKey": cloud_object_id, "name": file_name, "size": len(file_bytes), "uploadedAt": _now()}},
         status=201,
     )
 
