@@ -606,11 +606,9 @@ def standard_library(request, lib_key):
     try:
         client = get_nosql_client()
         if request.method == "GET":
-            # 飞机信息（机号/FSN/发动机等）属敏感数据：读取需持有 AIRNAV 短期 token。
-            if lib_key == "aircraft_info":
-                token = request.META.get("HTTP_X_AIRNAV_TOKEN", "")
-                if not _verify_airnav_token(token):
-                    return _error("需要 AIRNAV 授权才能读取飞机信息", 403)
+            # 飞机信息读取自 2026-09-06 起放开为公开（工作准备单机号回填需全量常驻本地，
+            # 输入框响应不依赖逐机号网络单查；与公开的 aircraft-numbers / aircraft-info 旁路对齐）。
+            # 写入（下方 PUT）仍保留 AIRNAV token 保护，防止外部整体篡改。
             return JsonResponse(
                 {"ok": True, "data": client.get_document(collection, doc_id)}
             )
