@@ -362,6 +362,118 @@ check("字段类型异常时不报错", views._project_max_item_id({"sections": 
 check("非字典文档返回空元数据", views._project_summary("字符串") == {})
 check("无 _id 时补空串（避免前端拿到 undefined）", views._project_summary({"name": "x"})["_id"] == "")
 
+# ————————————————————— 8. 项目 PATCH 的 matched 语义（A2 修复） —————————————————————
+# 背景：CloudBase 对不存在的文档执行 update 会返回 matched=0 且**不报错**。
+# 若调用方不检查 matched，就会把「保存到已删除/错误 id」表现为 200 成功
+# —— 数据实际没写入却无人察觉（静默数据丢失）。本节点把三种结果锁死：
+#   · 文档不存在            → 404（修复前误报 200 / 409）
+#   · 文档存在但版本不匹配  → 409（真并发冲突，前端按冲突流程重试）
+#   · 文档存在且版本匹配    → 200 且 version+1
+print("\n[8] 项目 PATCH 的 matched 语义（A2）")
+
+
+class _FakeClient:
+    """只实现 project_detail 路径用到的方法，行为对齐 CloudBase 实际语义。"""
+
+    def __init__(self, docs=None):
+        self.docs = dict(docs or {})
+
+    def get_document(self, collection, doc_id):
+        doc = self.docs.get((collection, doc_id))
+        if doc is None:
+            raise views.CloudBaseAPIError(404, "Document not found")
+        return doc
+
+    def insert_document(self, collection, document):
+        self.docs[(collection, document.get("_id"))] = dict(document)
+        return {"insertedIds": [document.get("_id")]}
+
+    def update_document(self, collection, doc_id, data, *, upsert=False):
+        key = (collection, doc_id)
+        if key not in self.docs:
+            # 关键：不存在时返回 matched=0，不抛异常（与上游一致）
+            return {"matched": 0, "upsert_id": None}
+        self._apply(key, data)
+        return {"matched": 1}
+
+    def update_documents_where(self, collection, query, data):
+        key = (collection, query.get("_id"))
+        doc = self.docs.get(key)
+        if doc is None:
+            return {"matched": 0}
+        for field, want in query.items():
+            if field == "_id":
+                continue
+            if doc.get(field) != want:
+                return {"matched": 0}  # 版本不匹配 → 乐观锁失败
+        self._apply(key, data)
+        return {"matched": 1}
+
+    def _apply(self, key, data):
+        doc = dict(self.docs[key])
+        for op, payload in data.items():
+            if op == "$set":
+                doc.update(payload)
+            elif op == "$inc":
+                for field, delta in payload.items():
+                    doc[field] = int(doc.get(field, 0)) + int(delta)
+        self.docs[key] = doc
+
+
+def _patch_project(project_id, body, client):
+    """以受控的 fake client 调用 project_detail，返回 (status_code, payload)。"""
+    request = RequestFactory().patch(
+        f"/api/projects/{project_id}/",
+        data=json.dumps(body),
+        content_type="application/json",
+    )
+    original = views.get_nosql_client
+    views.get_nosql_client = lambda: client
+    try:
+        response = views.project_detail(request, project_id)
+    finally:
+        views.get_nosql_client = original
+    return response.status_code, json.loads(response.content.decode("utf-8"))
+
+
+EXISTING = "proj-exists"
+base_doc = {"_id": EXISTING, "name": "原名称", "version": 7, "team": "A1"}
+
+# ① 文档不存在 + 不带版本号 → 必须 404（修复前是 200 假成功）
+code, payload = _patch_project("proj-missing", {"name": "x"}, _FakeClient({}))
+check("不存在的项目 PATCH → 404（不再是 200 假成功）", code == 404, f"实际 {code} {payload}")
+
+# ② 文档不存在 + 带版本号 → 必须 404（修复前是 409「已被他人修改」，会误导前端反复重试）
+code, payload = _patch_project(
+    "proj-missing", {"name": "x", "expected_version": 3}, _FakeClient({})
+)
+check("不存在的项目 PATCH（带版本号）→ 404 而非 409", code == 404, f"实际 {code} {payload}")
+
+# ③ 存在但版本不匹配 → 409 真并发冲突，且带回 current_version 供前端续跑
+code, payload = _patch_project(
+    EXISTING, {"name": "x", "expected_version": 999}, _FakeClient({(views.PROJECTS, EXISTING): dict(base_doc)})
+)
+check("版本不匹配 → 409", code == 409, f"实际 {code}")
+check("409 返回 current_version 供前端重试", payload.get("current_version") == 7, payload.get("current_version"))
+
+# ④ 存在且版本匹配 → 200 且 version 原子递增
+client = _FakeClient({(views.PROJECTS, EXISTING): dict(base_doc)})
+code, payload = _patch_project(EXISTING, {"name": "新名称", "expected_version": 7}, client)
+check("版本匹配 → 200", code == 200, f"实际 {code} {payload}")
+check("写入生效（名称已更新）", client.docs[(views.PROJECTS, EXISTING)]["name"] == "新名称")
+check("version 原子递增 7 → 8", client.docs[(views.PROJECTS, EXISTING)]["version"] == 8, client.docs[(views.PROJECTS, EXISTING)].get("version"))
+
+# ⑤ 存在但不带版本号（兼容旧调用方）→ 仍应成功
+client = _FakeClient({(views.PROJECTS, EXISTING): dict(base_doc)})
+code, _ = _patch_project(EXISTING, {"team": "A2"}, client)
+check("不带版本号更新已存在项目 → 200（向后兼容）", code == 200, f"实际 {code}")
+
+# ⑥ 校验分支不受影响
+check("无可更新字段 → 400", _patch_project(EXISTING, {"unknown": 1}, _FakeClient({(views.PROJECTS, EXISTING): dict(base_doc)}))[0] == 400)
+check("非法 aircraft_type → 400", _patch_project(EXISTING, {"aircraft_type": "B737"}, _FakeClient({(views.PROJECTS, EXISTING): dict(base_doc)}))[0] == 400)
+check("sections 非数组 → 400", _patch_project(EXISTING, {"sections": "x"}, _FakeClient({(views.PROJECTS, EXISTING): dict(base_doc)}))[0] == 400)
+check("非法 type → 400", _patch_project(EXISTING, {"type": "随便"}, _FakeClient({(views.PROJECTS, EXISTING): dict(base_doc)}))[0] == 400)
+
 # ————————————————————— 汇总 —————————————————————
 print("\n" + "=" * 60)
 if FAILED:

@@ -566,13 +566,22 @@ def project_detail(request, project_id):
                 {"$set": updates, "$inc": {"version": 1}},
             )
             if not isinstance(result, dict) or result.get("matched", 0) == 0:
+                # matched=0 有两种成因，必须区分：
+                # ① 文档存在但版本不匹配 → 真并发冲突（409，前端按冲突流程处理）；
+                # ② 文档根本不存在（已被他人删除 / id 过期）→ 404。
+                # 若不加区分，已删除的项目会被一直报成「并发修改」，前端会带着
+                # 新版本号反复重试，永远保存不上却始终显示"正在重试"。
                 current_version = None
+                exists = True
                 try:
                     current = client.get_document(PROJECTS, project_id)
                     if isinstance(current, dict):
                         current_version = int(current.get("version", 0))
-                except CloudBaseAPIError:
-                    pass
+                except CloudBaseAPIError as exc:
+                    if exc.status == 404:
+                        exists = False
+                if not exists:
+                    return _error("项目不存在或已被删除", 404)
                 return CompactJsonResponse(
                     {
                         "ok": False,
@@ -589,6 +598,11 @@ def project_detail(request, project_id):
                 # version 每次写入都原子递增，供冲突检测和审计使用。
                 {"$set": updates, "$inc": {"version": 1}},
             )
+            # ⚠️ 必须检查 matched：CloudBase 对不存在的文档返回 matched=0 且**不报错**，
+            # 若直接返回 200，则「保存到已删除/错误 id」会表现为成功 —— 数据实际
+            # 没有写入却无人察觉（静默数据丢失，调用方与日志都不会发现）。
+            if not isinstance(result, dict) or result.get("matched", 0) == 0:
+                return _error("项目不存在或已被删除", 404)
         _bump_revision(client, DOMAIN_PROJECTS)
         return CompactJsonResponse({"ok": True, "result": result})
     except ValueError as exc:
