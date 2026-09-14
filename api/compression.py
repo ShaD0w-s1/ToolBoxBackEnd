@@ -17,7 +17,10 @@ brotli 57.2 KB（−95.3%）/ gzip 222.2 KB（−81.9%）。
 from __future__ import annotations
 
 import gzip
+import logging
 import re
+
+logger = logging.getLogger(__name__)
 
 # brotli 为可选依赖：优先官方 `brotli`，其次 `brotlicffi`，都没有就只用 gzip。
 _brotli = None
@@ -132,6 +135,9 @@ class ResponseCompressionMiddleware:
         try:
             return self._maybe_compress(request, response)
         except Exception:  # pragma: no cover - 压缩绝不阻断业务
+            # 压缩是纯优化：任何异常都退回原响应，但**必须留下痕迹**。
+            # 早期版本此处静默吞异常，导致「压缩整体失效」在线上毫无线索。
+            logger.exception("响应压缩失败，已退回未压缩响应")
             return response
 
     def _maybe_compress(self, request, response):
@@ -150,6 +156,12 @@ class ResponseCompressionMiddleware:
         if encoding is None:
             return response
         compressed = compress_body(body, encoding)
+        if compressed is None and encoding != "gzip":
+            # 首选的 brotli 不可用或失败时回落 gzip：宁可少压一点，
+            # 也不要因为一个可选编码的问题而完全不压缩。
+            logger.warning("brotli 压缩失败，已回落 gzip")
+            encoding = "gzip"
+            compressed = compress_body(body, encoding)
         # 压缩没变小就保留原响应（小响应或已高度可压缩的内容可能出现）。
         if compressed is None or len(compressed) >= len(body):
             return response
