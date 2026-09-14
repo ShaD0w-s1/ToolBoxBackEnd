@@ -32,3 +32,10 @@ Thumbs.db
 
 # Deploy staging (regenerable from api/ + vendored deps)
 .deploy/
+
+# Deploy staging (regenerable from api/ + vendored deps)
+staging/
+stage-pkg/
+
+# Broken local venv moved aside during deploy (pyvenv.cfg points at another machine)
+.venv_bak/
