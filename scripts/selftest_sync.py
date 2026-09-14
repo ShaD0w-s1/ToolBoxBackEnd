@@ -306,6 +306,62 @@ check("文档不存在不抛异常", True)
 bad_doc = {"seq": 5, "domains": "不是字典"}
 check("domains 字段类型异常 → 全 0 兜底", all(v == "0" for v in views._read_revision(FakeClient(doc=bad_doc))[1].values()))
 
+# ————————————————————— 7. 列表轻量投影（档 2′） —————————————————————
+print("\n[7] 列表轻量投影 _project_summary / _project_max_item_id")
+sample_doc = {
+    "_id": "abc123",
+    "name": "6572 常州C转A",
+    "aircraft_type": "A320",
+    "type": "A检",
+    "team": "三车间",
+    "execute_date": "20260901",
+    "created_at": "2026-09-01T00:00:00Z",
+    "updated_at": "2026-09-02T00:00:00Z",
+    "version": 163,
+    "sections": [
+        {"name": "通用工具", "works": [
+            {"name": "零散包工作", "items": [{"name": "注油枪", "quantity": 1}, {"name": "堵盖", "quantity": 1}]},
+            {"name": "其他", "items": [{"name": "扳手", "quantity": 2}]},
+        ]},
+        {"name": "发动机", "works": [{"name": "检查", "items": [{"name": "内窥镜", "quantity": 1}]}]},
+    ],
+    "material_list": [
+        {"name": "通用航材", "works": [{"name": "检查", "items": [{"name": "开口销", "quantity": 4}]}]},
+    ],
+    "prep_sheet": {"groups": [{"title": "x"}]},
+    "workcard_assignment": {"sections": [{"n": 1}]},
+    "standalone_prep_sheet": {"base": {"reg": "B-1234"}},
+    "gantt_prep": {"charts": [{"cards": [{"id": "c1"}]}]},
+}
+summary = views._project_summary(sample_doc)
+heavy_keys = ["sections", "prep_sheet", "workcard_assignment", "standalone_prep_sheet", "material_list", "gantt_prep"]
+check("轻量投影不含任何重字段", not any(k in summary for k in heavy_keys), f"实际键 {sorted(summary)}")
+for light in ("_id", "name", "aircraft_type", "type", "team", "execute_date", "updated_at", "version"):
+    check(f"保留轻量字段 {light}", light in summary)
+check(
+    "max_item_id = 物品总条数（sections 4 + material_list 1）",
+    summary["max_item_id"] == 5,
+    f"实际 {summary.get('max_item_id')}",
+)
+# 用贴近真实的规模核对压缩比（真实项目平均 28.9 KB，重字段占 98%）。
+big_doc = dict(sample_doc)
+big_doc["sections"] = [
+    {"name": f"部位{i}", "notes": "备注" * 10,
+     "works": [{"name": "工作", "items": [{"name": f"工具{j}", "quantity": 1, "uid": f"u{i}-{j}", "partNo": "PN-123456"} for j in range(20)]}]}
+    for i in range(10)
+]
+light_len = len(json.dumps(views._project_summary(big_doc), ensure_ascii=False))
+full_len = len(json.dumps(big_doc, ensure_ascii=False))
+check(
+    f"真实规模下轻量投影占比 <5%（{full_len} → {light_len} 字节）",
+    light_len < full_len * 0.05,
+)
+
+check("缺少 works 时不报错", views._project_max_item_id({"sections": [{"name": "x"}]}) == 0)
+check("字段类型异常时不报错", views._project_max_item_id({"sections": "不是数组", "material_list": None}) == 0)
+check("非字典文档返回空元数据", views._project_summary("字符串") == {})
+check("无 _id 时补空串（避免前端拿到 undefined）", views._project_summary({"name": "x"})["_id"] == "")
+
 # ————————————————————— 汇总 —————————————————————
 print("\n" + "=" * 60)
 if FAILED:

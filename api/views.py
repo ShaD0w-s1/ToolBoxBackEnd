@@ -216,6 +216,58 @@ def _normalize_list_payload(result: object) -> dict:
     return dict(result)
 
 
+# 列表响应允许返回的轻量字段；其余（sections / prep_sheet / workcard_assignment /
+# standalone_prep_sheet / material_list / gantt_prep）由 /api/projects/<id>/ 按需返回。
+PROJECT_LIST_FIELDS = (
+    "_id",
+    "name",
+    "aircraft_type",
+    "type",
+    "team",
+    "execute_date",
+    "created_at",
+    "updated_at",
+    "version",
+)
+
+
+def _project_max_item_id(document: dict) -> int:
+    """项目内物品的最大本地编号。
+
+    客户端把 sections / material_list 读回内存时按 1..N 顺序编号（见前端
+    ``stateFromSections``），所以「物品条数」就是该项目的最大编号。客户端拿它
+    计算新增行的不冲突编号，这样列表不必返回重字段也能维持原有不变式
+    （新增物品的编号大于所有项目的既有编号）。
+
+    注意：持久化结构里物品只有 ``uid``，没有本地数字 id，因此服务端只能按
+    条数推算 —— 这与客户端重新载入时的编号结果完全一致。
+    """
+    total = 0
+    for key in ("sections", "material_list"):
+        groups = document.get(key)
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            works = group.get("works") if isinstance(group, dict) else None
+            if not isinstance(works, list):
+                continue
+            for work in works:
+                items = work.get("items") if isinstance(work, dict) else None
+                if isinstance(items, list):
+                    total += len(items)
+    return total
+
+
+def _project_summary(document: object) -> dict:
+    """把项目文档裁剪为列表用的轻量元数据（不含重字段）。"""
+    if not isinstance(document, dict):
+        return {}
+    summary = {key: document.get(key) for key in PROJECT_LIST_FIELDS if key in document}
+    summary["_id"] = str(document.get("_id", ""))
+    summary["max_item_id"] = _project_max_item_id(document)
+    return summary
+
+
 def index(request):
     return CompactJsonResponse(
         {
@@ -392,7 +444,14 @@ def projects(request):
             )
             # 归一为单一 data 数组：早期写法保留原键会让同一数组在响应里出现
             # 两次（实测多传 433 KB，占该响应 35%），而客户端只读 data。
-            return CompactJsonResponse({"ok": True, **_normalize_list_payload(result)})
+            normalized = _normalize_list_payload(result)
+            # 列表只回**轻量元数据**，重字段由 /api/projects/<id>/ 按需返回。
+            # 实测把该响应从 1227.7 KB 降到约 3 KB：列表页本就只显示名称/类型/
+            # 班组/执行日期，把 15 个项目的完整内容全传一遍纯属浪费。
+            documents = normalized.get("data")
+            if isinstance(documents, list):
+                normalized = {**normalized, "data": [_project_summary(doc) for doc in documents]}
+            return CompactJsonResponse({"ok": True, **normalized})
 
         body = _json_body(request)
         name = str(body.get("name", "")).strip()
