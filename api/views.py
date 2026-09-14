@@ -24,7 +24,18 @@ from .cloudbase_nosql import (
     CloudBaseNoSQLClient,
 )
 from .cloudbase_storage import CloudBaseStorageClient
+from .jsonio import CompactJsonResponse
 from .polling import PollingPayloadError
+from .sync_domains import (
+    DOMAIN_ANNOUNCEMENT,
+    DOMAIN_CART,
+    DOMAIN_CONTROL,
+    DOMAIN_PROJECTS,
+    DOMAIN_STDLIBS,
+    DOMAIN_SYNC_TEMPLATES,
+    DOMAIN_TEMPLATES,
+    SYNC_DOMAINS,
+)
 from .workcard_filter import (
     apply_material_filter,
     apply_tool_filter,
@@ -108,7 +119,7 @@ def _error(message: str, status: int, details=None) -> JsonResponse:
     payload = {"ok": False, "error": message}
     if details is not None:
         payload["details"] = details
-    return JsonResponse(payload, status=status)
+    return CompactJsonResponse(payload, status=status)
 
 
 def _handle_cloudbase_error(exc: Exception) -> JsonResponse:
@@ -125,36 +136,88 @@ def get_nosql_client() -> CloudBaseNoSQLClient:
     return CloudBaseNoSQLClient()
 
 
-def _bump_revision(client: CloudBaseNoSQLClient) -> None:
-    """递增单计数器文档 seq，作为全局单调递增的 revision 来源。
+def _bump_revision(client: CloudBaseNoSQLClient, domain: str) -> None:
+    """递增计数器文档：全局 ``seq`` + 指定域的域计数。
 
-    每次写操作成功后调用。计数器文档尚不存在时自动创建（seq=1）。
-    变更日志失败不影响主写入（最坏情况 poll 检测不到该次变更，退化为手动刷新）。
+    * ``seq``：全局单调递增，保留给旧客户端与 watch 推送（只需判断「有变化」）。
+    * ``domains.<domain>``：供分域客户端判断「哪个域变了」，从而只重拉该域的
+      端点，而不是每次变化都重拉全部 12 个端点。
+
+    ⚠️ 域写错不会报错、只会导致该域永不触发同步（**静默漏同步**）。此处刻意
+    不抛异常 —— 调用点发生在写入成功之后，抛错会把 200 变成 500 并让客户端
+    误判为保存失败；改为退化成「仅全局递增」，由
+    ``scripts/check_sync_domains.py`` 在提交前拦截这类错误。
+
+    计数器文档尚不存在时自动创建。变更日志失败不影响主写入（最坏情况 poll
+    检测不到该次变更，退化为手动刷新）。
     """
+    increments: dict[str, int] = {"seq": 1}
+    seed_domains: dict[str, int] = {}
+    if domain in SYNC_DOMAINS:
+        increments[f"domains.{domain}"] = 1
+        seed_domains[domain] = 1
     try:
         result = client.update_document(
-            CHANGE_LOG, REVISION_DOC_ID, {"$inc": {"seq": 1}}, upsert=False
+            CHANGE_LOG, REVISION_DOC_ID, {"$inc": increments}, upsert=False
         )
         if isinstance(result, dict) and result.get("matched") == 0:
-            client.insert_document(CHANGE_LOG, {"_id": REVISION_DOC_ID, "seq": 1})
+            client.insert_document(
+                CHANGE_LOG,
+                {"_id": REVISION_DOC_ID, "seq": 1, "domains": seed_domains},
+            )
     except (CloudBaseAPIError, CloudBaseConfigError):
         pass
 
 
-def _read_revision(client: CloudBaseNoSQLClient) -> str:
-    """读取计数器文档的 seq，作为当前 revision。文档不存在视为 0。"""
+def _read_revision(client: CloudBaseNoSQLClient) -> tuple[str, dict[str, str]]:
+    """读取计数器文档，返回 ``(全局 seq, 各域 seq)``；文档不存在视为 0。
+
+    各域**始终全量返回**（缺失的域补 "0"），这样客户端可以直接逐域比较，
+    不必区分「域不存在」与「域为 0」两种情况。
+    """
     try:
         doc = client.get_document(CHANGE_LOG, REVISION_DOC_ID)
     except CloudBaseAPIError as exc:
         if exc.status == 404:
-            return "0"
+            return "0", {name: "0" for name in SYNC_DOMAINS}
         raise
-    seq = int(doc.get("seq", 0)) if isinstance(doc, dict) else 0
-    return str(seq)
+    if not isinstance(doc, dict):
+        return "0", {name: "0" for name in SYNC_DOMAINS}
+    seq = str(int(doc.get("seq", 0)))
+    raw_domains = doc.get("domains")
+    domains: dict[str, str] = {}
+    for name in SYNC_DOMAINS:
+        value = raw_domains.get(name, 0) if isinstance(raw_domains, dict) else 0
+        try:
+            domains[name] = str(int(value))
+        except (TypeError, ValueError):
+            domains[name] = "0"
+    return seq, domains
+
+
+def _normalize_list_payload(result: object) -> dict:
+    """把 CloudBase 列表响应归一为「只有一个数组键」。
+
+    早期实现用 ``{**result, "data": result[key]}`` 保留原键，导致同一个数组在
+    响应里出现两次 —— 实测 ``/api/projects/?limit=100`` 因此多传 433 KB（占
+    35%），且客户端只会读 ``data``。这里改为「取到数组后删除其余数组键」。
+    """
+    if not isinstance(result, dict):
+        return {"data": result}
+    array_keys = ("list", "documents", "items")
+    for key in array_keys:
+        value = result.get(key)
+        if isinstance(value, list):
+            payload = dict(result)
+            for other in array_keys:
+                payload.pop(other, None)
+            payload["data"] = value
+            return payload
+    return dict(result)
 
 
 def index(request):
-    return JsonResponse(
+    return CompactJsonResponse(
         {
             "message": "Django API is running",
             "path": request.path,
@@ -166,7 +229,7 @@ def index(request):
 @ensure_csrf_cookie
 @require_http_methods(["GET"])
 def csrf(request):
-    return JsonResponse({"ok": True, "csrf_token": get_token(request)})
+    return CompactJsonResponse({"ok": True, "csrf_token": get_token(request)})
 
 
 def _client_ip(request: HttpRequest) -> str:
@@ -249,16 +312,16 @@ def airnav_verify(request):
     if password and hmac.compare_digest(password.encode("utf-8"), expected.encode("utf-8")):
         _airnav_ok(ip)
         token, _ = _issue_airnav_token()
-        return JsonResponse({"ok": True, "verified": True, "token": token, "expires_in": AIRNAV_TOKEN_TTL})
+        return CompactJsonResponse({"ok": True, "verified": True, "token": token, "expires_in": AIRNAV_TOKEN_TTL})
     _airnav_fail(ip)
-    return JsonResponse({"ok": False, "verified": False, "error": "AIRNAV 密码错误"}, status=403)
+    return CompactJsonResponse({"ok": False, "verified": False, "error": "AIRNAV 密码错误"}, status=403)
 
 
 @require_http_methods(["GET"])
 def cloudbase_status(request):
     # 只返回是否完成配置，绝不把 API Key 内容发送给客户端。
     api_key = os.getenv("CLOUDBASE_API_KEY", "")
-    return JsonResponse(
+    return CompactJsonResponse(
         {
             "ok": True,
             "env_id": os.getenv("CLOUDBASE_ENV_ID", ""),
@@ -277,19 +340,31 @@ def cloudbase_status(request):
 
 @require_http_methods(["GET"])
 def poll(request):
-    """返回所有用户可见业务数据的稳定修订值（来自单计数器文档，成本 O(1) 读）。"""
+    """返回业务数据的修订值：全局 ``revision`` + 各域修订值（成本 O(1) 读）。
+
+    客户端据此**只重拉真正变化的域**对应的端点，而不是每次变化都重拉全部
+    12 个端点（实测约 1.4 MB）。``scope`` 是能力标记，让新旧客户端都能工作：
+
+    * 旧客户端：只读 ``revision`` / ``changed``，行为与以前一致（全量重拉）。
+    * 新客户端：认 ``scope == "domains"``，逐域比较后只拉变化域。
+    """
     try:
-        revision = _read_revision(get_nosql_client())
+        revision, domains = _read_revision(get_nosql_client())
         # 首次不带 revision 只建立基线；之后仅在值不同时报告 changed。
         previous = request.GET.get("revision", "").strip().strip('"')
-        response = JsonResponse(
-            {
-                "ok": True,
-                "revision": revision,
-                "changed": bool(previous and previous != revision),
-                "poll_after_ms": 5000,
-            }
-        )
+        changed = bool(previous and previous != revision)
+        payload: dict[str, object] = {
+            "ok": True,
+            "revision": revision,
+            "changed": changed,
+            "scope": "domains",
+            "poll_after_ms": 5000,
+        }
+        # 仅在「有变化」或「客户端尚无基线」时附带域映射：空闲时把响应压在
+        # 百字节级，避免 2 秒一次的空轮询把省下的流量又吃回去。
+        if changed or not previous:
+            payload["domains"] = domains
+        response = CompactJsonResponse(payload)
         # 禁止中间缓存复用旧结果；ETag 供支持条件请求的客户端扩展使用。
         response["ETag"] = f'"{revision}"'
         response["Cache-Control"] = "no-store"
@@ -315,12 +390,9 @@ def projects(request):
                 offset=offset,
                 order=[{"field": "created_at", "direction": "desc"}],
             )
-            if isinstance(result, dict) and not isinstance(result.get("data"), list):
-                for key in ("list", "documents", "items"):
-                    if isinstance(result.get(key), list):
-                        result = {**result, "data": result[key]}
-                        break
-            return JsonResponse({"ok": True, **result})
+            # 归一为单一 data 数组：早期写法保留原键会让同一数组在响应里出现
+            # 两次（实测多传 433 KB，占该响应 35%），而客户端只读 data。
+            return CompactJsonResponse({"ok": True, **_normalize_list_payload(result)})
 
         body = _json_body(request)
         name = str(body.get("name", "")).strip()
@@ -361,8 +433,8 @@ def projects(request):
         if not isinstance(document["sections"], list):
             return _error("sections 必须是数组", 400)
         client.insert_document(PROJECTS, document)
-        _bump_revision(client)
-        return JsonResponse({"ok": True, "data": document}, status=201)
+        _bump_revision(client, DOMAIN_PROJECTS)
+        return CompactJsonResponse({"ok": True, "data": document}, status=201)
     except ValueError as exc:
         return _error(str(exc), 400)
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
@@ -374,13 +446,13 @@ def project_detail(request, project_id):
     try:
         client = get_nosql_client()
         if request.method == "GET":
-            return JsonResponse(
+            return CompactJsonResponse(
                 {"ok": True, "data": client.get_document(PROJECTS, project_id)}
             )
         if request.method == "DELETE":
             result = client.delete_document(PROJECTS, project_id)
-            _bump_revision(client)
-            return JsonResponse({"ok": True, "result": result})
+            _bump_revision(client, DOMAIN_PROJECTS)
+            return CompactJsonResponse({"ok": True, "result": result})
 
         body = _json_body(request)
         # 乐观锁：客户端带上 expected_version，用原子条件写实现（version 放进 query）。
@@ -442,7 +514,7 @@ def project_detail(request, project_id):
                         current_version = int(current.get("version", 0))
                 except CloudBaseAPIError:
                     pass
-                return JsonResponse(
+                return CompactJsonResponse(
                     {
                         "ok": False,
                         "error": "数据已被他人修改，请刷新后重试",
@@ -458,8 +530,8 @@ def project_detail(request, project_id):
                 # version 每次写入都原子递增，供冲突检测和审计使用。
                 {"$set": updates, "$inc": {"version": 1}},
             )
-        _bump_revision(client)
-        return JsonResponse({"ok": True, "result": result})
+        _bump_revision(client, DOMAIN_PROJECTS)
+        return CompactJsonResponse({"ok": True, "result": result})
     except ValueError as exc:
         return _error(str(exc), 400)
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
@@ -474,7 +546,7 @@ def aircraft_template(request, aircraft_type):
     try:
         client = get_nosql_client()
         if request.method == "GET":
-            return JsonResponse(
+            return CompactJsonResponse(
                 {"ok": True, "data": client.get_document(TEMPLATES, aircraft_type)}
             )
         body = _json_body(request)
@@ -494,8 +566,8 @@ def aircraft_template(request, aircraft_type):
             # 标准库首次保存时可能尚不存在，因此允许原子创建或更新。
             upsert=True,
         )
-        _bump_revision(client)
-        return JsonResponse({"ok": True, "result": result})
+        _bump_revision(client, DOMAIN_TEMPLATES)
+        return CompactJsonResponse({"ok": True, "result": result})
     except ValueError as exc:
         return _error(str(exc), 400)
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
@@ -511,7 +583,7 @@ def material_template(request, aircraft_type):
     try:
         client = get_nosql_client()
         if request.method == "GET":
-            return JsonResponse(
+            return CompactJsonResponse(
                 {"ok": True, "data": client.get_document(MATERIAL_TEMPLATES, aircraft_type)}
             )
         body = _json_body(request)
@@ -530,8 +602,8 @@ def material_template(request, aircraft_type):
             },
             upsert=True,
         )
-        _bump_revision(client)
-        return JsonResponse({"ok": True, "result": result})
+        _bump_revision(client, DOMAIN_TEMPLATES)
+        return CompactJsonResponse({"ok": True, "result": result})
     except ValueError as exc:
         return _error(str(exc), 400)
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
@@ -543,7 +615,7 @@ def tool_cart(request):
     try:
         client = get_nosql_client()
         if request.method == "GET":
-            return JsonResponse(
+            return CompactJsonResponse(
                 {"ok": True, "data": client.get_document(TOOL_CART, "default")}
             )
         body = _json_body(request)
@@ -557,8 +629,8 @@ def tool_cart(request):
             # 工具车使用固定文档 ID，首次保存时允许直接创建。
             upsert=True,
         )
-        _bump_revision(client)
-        return JsonResponse({"ok": True, "result": result})
+        _bump_revision(client, DOMAIN_CART)
+        return CompactJsonResponse({"ok": True, "result": result})
     except ValueError as exc:
         return _error(str(exc), 400)
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
@@ -571,7 +643,7 @@ def announcement(request):
     try:
         client = get_nosql_client()
         if request.method == "GET":
-            return JsonResponse(
+            return CompactJsonResponse(
                 {"ok": True, "data": client.get_document(ANNOUNCEMENT, "default")}
             )
         body = _json_body(request)
@@ -584,8 +656,8 @@ def announcement(request):
             {"$set": {"content": content, "updated_at": _now()}},
             upsert=True,
         )
-        _bump_revision(client)
-        return JsonResponse({"ok": True, "result": result})
+        _bump_revision(client, DOMAIN_ANNOUNCEMENT)
+        return CompactJsonResponse({"ok": True, "result": result})
     except ValueError as exc:
         return _error(str(exc), 400)
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
@@ -609,7 +681,7 @@ def standard_library(request, lib_key):
             # 飞机信息读取自 2026-09-06 起放开为公开（工作准备单机号回填需全量常驻本地，
             # 输入框响应不依赖逐机号网络单查；与公开的 aircraft-numbers / aircraft-info 旁路对齐）。
             # 写入（下方 PUT）仍保留 AIRNAV token 保护，防止外部整体篡改。
-            return JsonResponse(
+            return CompactJsonResponse(
                 {"ok": True, "data": client.get_document(collection, doc_id)}
             )
         body = _json_body(request)
@@ -630,8 +702,8 @@ def standard_library(request, lib_key):
             {"$set": {"rows": rows, "updated_at": _now()}},
             upsert=True,
         )
-        _bump_revision(client)
-        return JsonResponse({"ok": True, "result": result})
+        _bump_revision(client, DOMAIN_STDLIBS)
+        return CompactJsonResponse({"ok": True, "result": result})
     except ValueError as exc:
         return _error(str(exc), 400)
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
@@ -655,7 +727,7 @@ def app_config(request):
         else:
             return _handle_cloudbase_error(exc)
     data = doc if isinstance(doc, dict) else {}
-    return JsonResponse(
+    return CompactJsonResponse(
         {
             "ok": True,
             "data": {
@@ -781,9 +853,9 @@ def apply_workcard(request, project_id):
             updates["prep_sheet"] = prep_sheet
             updates["workcard_assignment"] = assignment
         client.update_document(PROJECTS, project_id, {"$set": updates, "$inc": {"version": 1}})
-        _bump_revision(client)
+        _bump_revision(client, DOMAIN_PROJECTS)
 
-        return JsonResponse(
+        return CompactJsonResponse(
             {
                 "ok": True,
                 "data": {
@@ -819,7 +891,7 @@ def aircraft_numbers(request):
                 if str(row.get("飞机号") or "").strip()
             }
         )
-        return JsonResponse({"ok": True, "data": numbers})
+        return CompactJsonResponse({"ok": True, "data": numbers})
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
         return _handle_cloudbase_error(exc)
 
@@ -836,14 +908,14 @@ def aircraft_info(request):
     if request.method == "GET":
         reg = str(request.GET.get("reg", "") or "").strip().upper()
         if not reg:
-            return JsonResponse({"ok": True, "data": None})
+            return CompactJsonResponse({"ok": True, "data": None})
         try:
             client = get_nosql_client()
             rows = _read_std_rows(client, AIRCRAFT_INFO)
             for row in rows:
                 if str(row.get("飞机号") or "").strip().upper() == reg:
-                    return JsonResponse({"ok": True, "data": row})
-            return JsonResponse({"ok": True, "data": None})
+                    return CompactJsonResponse({"ok": True, "data": row})
+            return CompactJsonResponse({"ok": True, "data": None})
         except (CloudBaseConfigError, CloudBaseAPIError) as exc:
             return _handle_cloudbase_error(exc)
 
@@ -879,8 +951,8 @@ def aircraft_info(request):
             {"$set": {"rows": rows, "updated_at": _now()}},
             upsert=True,
         )
-        _bump_revision(client)
-        return JsonResponse({"ok": True, "data": new_row, "updated": updated})
+        _bump_revision(client, DOMAIN_STDLIBS)
+        return CompactJsonResponse({"ok": True, "data": new_row, "updated": updated})
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
         return _handle_cloudbase_error(exc)
 
@@ -916,7 +988,7 @@ def control_docs(request):
                     if isinstance(result.get(key), list):
                         docs = result[key]
                         break
-            return JsonResponse({"ok": True, "data": docs or []})
+            return CompactJsonResponse({"ok": True, "data": docs or []})
 
         body = _json_body(request)
         doc_type = str(body.get("type", "")).strip()
@@ -950,8 +1022,8 @@ def control_docs(request):
             "uploadedAt": _now(),
         }
         client.insert_document(CONTROL_DOCS, document)
-        _bump_revision(client)
-        return JsonResponse({"ok": True, "data": document}, status=201)
+        _bump_revision(client, DOMAIN_CONTROL)
+        return CompactJsonResponse({"ok": True, "data": document}, status=201)
     except ValueError as exc:
         return _error(str(exc), 400)
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
@@ -974,13 +1046,13 @@ def control_doc_detail(request, doc_id):
                 except (CloudBaseConfigError, CloudBaseAPIError):
                     pass  # 文件删除失败不阻断元数据删除
             client.delete_document(CONTROL_DOCS, doc_id)
-            _bump_revision(client)
-            return JsonResponse({"ok": True})
+            _bump_revision(client, DOMAIN_CONTROL)
+            return CompactJsonResponse({"ok": True})
         cloud_id = doc.get("cloudObjectId")
         if not cloud_id:
             return _error("该记录缺少 fileid", 400)
         url = _get_storage_client().get_download_url(str(cloud_id))
-        return JsonResponse({"ok": True, "data": {"downloadUrl": url, "fileName": doc.get("fileName", "")}})
+        return CompactJsonResponse({"ok": True, "data": {"downloadUrl": url, "fileName": doc.get("fileName", "")}})
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
         return _handle_cloudbase_error(exc)
 
@@ -1025,7 +1097,7 @@ def prep_attachment_file(request):
             cloud_object_id = storage.upload_bytes(file_key, file_bytes, content_type="application/octet-stream")
         except (CloudBaseConfigError, CloudBaseAPIError) as exc:
             return _handle_cloudbase_error(exc)
-        return JsonResponse(
+        return CompactJsonResponse(
             {"ok": True, "data": {"fileKey": cloud_object_id, "name": file_name, "size": len(file_bytes), "uploadedAt": _now()}},
             status=201,
         )
@@ -1035,9 +1107,9 @@ def prep_attachment_file(request):
     try:
         if request.method == "DELETE":
             storage.delete_object(file_key)
-            return JsonResponse({"ok": True})
+            return CompactJsonResponse({"ok": True})
         url = storage.get_download_url(file_key)
-        return JsonResponse({"ok": True, "data": {"downloadUrl": url}})
+        return CompactJsonResponse({"ok": True, "data": {"downloadUrl": url}})
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
         return _handle_cloudbase_error(exc)
 
@@ -1085,8 +1157,12 @@ def identity(request):
         )
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
         return _handle_cloudbase_error(exc)
-    _bump_revision(client)
-    return JsonResponse({"ok": True, "data": {"name": name, "last_seen": now, "login_count": login_count}})
+    # 刻意**不**调用 _bump_revision：身份心跳只更新账号目录的 last_seen /
+    # login_count，属于「在线状态」而非业务数据，而客户端重拉的端点里根本不含
+    # 账号数据 —— 广播它等于 100% 无效重拉。早期版本在此广播，导致每个在线用户
+    # 每 60 秒让其他所有人重拉约 1.4 MB（N ×（N−1）× 1.4 MB / 分钟）。
+    # 账号列表由站点管理面板打开时显式拉取，不依赖 revision 变化。
+    return CompactJsonResponse({"ok": True, "data": {"name": name, "last_seen": now, "login_count": login_count}})
 
 
 @require_http_methods(["GET"])
@@ -1112,7 +1188,7 @@ def accounts(request):
                         }
                     )
         accounts.sort(key=lambda a: a.get("last_seen", ""), reverse=True)
-        return JsonResponse({"ok": True, "data": accounts})
+        return CompactJsonResponse({"ok": True, "data": accounts})
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
         return _handle_cloudbase_error(exc)
 
@@ -1142,7 +1218,7 @@ def online_count(request):
                         count += 1
                 except ValueError:
                     continue
-        return JsonResponse({"ok": True, "data": {"count": count}})
+        return CompactJsonResponse({"ok": True, "data": {"count": count}})
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
         return _handle_cloudbase_error(exc)
 
@@ -1208,7 +1284,7 @@ def editing(request):
                 )
             except (CloudBaseConfigError, CloudBaseAPIError):
                 pass  # 文档不存在视为已释放
-        return JsonResponse({"ok": True})
+        return CompactJsonResponse({"ok": True})
 
     project_id = request.GET.get("project_id", "").strip()
     if not project_id:
@@ -1252,7 +1328,7 @@ def editing(request):
                     "key": key,
                 }
             )
-    return JsonResponse({"ok": True, "data": active})
+    return CompactJsonResponse({"ok": True, "data": active})
 
 
 @require_http_methods(["GET", "POST"])
@@ -1272,7 +1348,7 @@ def eng_templates(request):
                     if isinstance(result.get(key), list):
                         docs = result[key]
                         break
-            return JsonResponse({"ok": True, "data": docs or []})
+            return CompactJsonResponse({"ok": True, "data": docs or []})
         except (CloudBaseConfigError, CloudBaseAPIError) as exc:
             return _handle_cloudbase_error(exc)
 
@@ -1291,8 +1367,8 @@ def eng_templates(request):
     document = {"_id": doc_id, "id": doc_id, "name": name, "savedAt": now, "state": state}
     try:
         client.insert_document(ENG_TEMPLATES, document)
-        _bump_revision(client)
-        return JsonResponse({"ok": True, "data": document}, status=201)
+        _bump_revision(client, DOMAIN_SYNC_TEMPLATES)
+        return CompactJsonResponse({"ok": True, "data": document}, status=201)
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
         return _handle_cloudbase_error(exc)
 
@@ -1303,11 +1379,11 @@ def eng_template_detail(request, template_id):
     client = get_nosql_client()
     try:
         if request.method == "GET":
-            return JsonResponse({"ok": True, "data": client.get_document(ENG_TEMPLATES, template_id)})
+            return CompactJsonResponse({"ok": True, "data": client.get_document(ENG_TEMPLATES, template_id)})
         if request.method == "DELETE":
             client.delete_document(ENG_TEMPLATES, template_id)
-            _bump_revision(client)
-            return JsonResponse({"ok": True})
+            _bump_revision(client, DOMAIN_SYNC_TEMPLATES)
+            return CompactJsonResponse({"ok": True})
         body = _json_body(request)
         name = str(body.get("name", "")).strip()
         state = body.get("state")
@@ -1321,8 +1397,8 @@ def eng_template_detail(request, template_id):
             {"$set": {"name": name, "state": state, "savedAt": _now()}},
             upsert=True,
         )
-        _bump_revision(client)
-        return JsonResponse({"ok": True})
+        _bump_revision(client, DOMAIN_SYNC_TEMPLATES)
+        return CompactJsonResponse({"ok": True})
     except ValueError as exc:
         return _error(str(exc), 400)
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
@@ -1346,8 +1422,8 @@ def eng_template_duplicate(request, template_id):
             "state": doc.get("state", {}),
         }
         client.insert_document(ENG_TEMPLATES, new_doc)
-        _bump_revision(client)
-        return JsonResponse({"ok": True, "data": new_doc}, status=201)
+        _bump_revision(client, DOMAIN_SYNC_TEMPLATES)
+        return CompactJsonResponse({"ok": True, "data": new_doc}, status=201)
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
         return _handle_cloudbase_error(exc)
 
@@ -1368,7 +1444,7 @@ def standalone_templates(request):
                     if isinstance(result.get(key), list):
                         docs = result[key]
                         break
-            return JsonResponse({"ok": True, "data": docs or []})
+            return CompactJsonResponse({"ok": True, "data": docs or []})
         except (CloudBaseConfigError, CloudBaseAPIError) as exc:
             return _handle_cloudbase_error(exc)
 
@@ -1387,8 +1463,8 @@ def standalone_templates(request):
     document = {"_id": doc_id, "id": doc_id, "name": name, "savedAt": now, "state": state}
     try:
         client.insert_document(STANDALONE_TEMPLATES, document)
-        _bump_revision(client)
-        return JsonResponse({"ok": True, "data": document}, status=201)
+        _bump_revision(client, DOMAIN_SYNC_TEMPLATES)
+        return CompactJsonResponse({"ok": True, "data": document}, status=201)
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
         return _handle_cloudbase_error(exc)
 
@@ -1399,11 +1475,11 @@ def standalone_template_detail(request, template_id):
     client = get_nosql_client()
     try:
         if request.method == "GET":
-            return JsonResponse({"ok": True, "data": client.get_document(STANDALONE_TEMPLATES, template_id)})
+            return CompactJsonResponse({"ok": True, "data": client.get_document(STANDALONE_TEMPLATES, template_id)})
         if request.method == "DELETE":
             client.delete_document(STANDALONE_TEMPLATES, template_id)
-            _bump_revision(client)
-            return JsonResponse({"ok": True})
+            _bump_revision(client, DOMAIN_SYNC_TEMPLATES)
+            return CompactJsonResponse({"ok": True})
         body = _json_body(request)
         name = str(body.get("name", "")).strip()
         state = body.get("state")
@@ -1417,8 +1493,8 @@ def standalone_template_detail(request, template_id):
             {"$set": {"name": name, "state": state, "savedAt": _now()}},
             upsert=True,
         )
-        _bump_revision(client)
-        return JsonResponse({"ok": True})
+        _bump_revision(client, DOMAIN_SYNC_TEMPLATES)
+        return CompactJsonResponse({"ok": True})
     except ValueError as exc:
         return _error(str(exc), 400)
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
@@ -1442,7 +1518,7 @@ def standalone_template_duplicate(request, template_id):
             "state": doc.get("state", {}),
         }
         client.insert_document(STANDALONE_TEMPLATES, new_doc)
-        _bump_revision(client)
-        return JsonResponse({"ok": True, "data": new_doc}, status=201)
+        _bump_revision(client, DOMAIN_SYNC_TEMPLATES)
+        return CompactJsonResponse({"ok": True, "data": new_doc}, status=201)
     except (CloudBaseConfigError, CloudBaseAPIError) as exc:
         return _handle_cloudbase_error(exc)

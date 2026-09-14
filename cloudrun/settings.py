@@ -34,6 +34,8 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    # 与生产 settings_scf 保持一致：压缩放在最外层，便于本地复现线上压缩行为。
+    "api.compression.ResponseCompressionMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "corsheaders.middleware.CorsMiddleware",

@@ -1,1 +1,3 @@
 django>=4.2,<5.0
+# 可选：提供 brotli 响应压缩。缺失时压缩中间件自动回落 gzip（见 api/compression.py）。
+Brotli>=1.1,<2.0

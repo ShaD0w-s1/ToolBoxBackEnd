@@ -19,7 +19,13 @@ CSRF_TRUSTED_ORIGINS = [
     if origin.strip()
 ]
 INSTALLED_APPS = ["api"]
-MIDDLEWARE = ["django.middleware.common.CommonMiddleware"]
+# 压缩中间件放在最外层：响应阶段它最后执行，压缩后的 Content-Length 才不会被
+# CommonMiddleware 覆盖。云函数本身不压缩（实测网关仅在 header 声明
+# Vary: Accept-Encoding，即使客户端请求 br 也不压缩），必须由应用层处理。
+MIDDLEWARE = [
+    "api.compression.ResponseCompressionMiddleware",
+    "django.middleware.common.CommonMiddleware",
+]
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",

@@ -13,3 +13,6 @@ cloudrun/wsgi.py
 manage.py
 requirements.txt
 scf_bootstrap
+api/compression.py
+api/jsonio.py
+api/sync_domains.py
