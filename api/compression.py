@@ -1,23 +1,41 @@
-"""响应压缩中间件：优先 brotli，回落 gzip。
+"""响应压缩中间件：能协商时择优（br > gzip），协商不到时按显式策略兜底。
 
-设计取舍（改动时务必保持）
+为什么需要「兜底策略」而不是只靠协商
+------------------------------------
+实测 CloudBase 网关会把客户端真实的 ``Accept-Encoding`` **改写为 ``identity``**
+再转发给云函数，而网关自己并不压缩。也就是说在这条链路上：
+
+* 云函数永远看不到浏览器的真实编码偏好（拿到的永远是 ``identity``）；
+* 「仅按 Accept-Encoding 协商」的结果 = **永远不压缩**。
+
+这类失效是静默的（HTTP 200、内容正确、只是体积没降），因此本模块把兜底策略做成
+**显式配置**，并保证默认值在线上是可用的：
+
+``RESPONSE_COMPRESSION_FORCE``
+    * ``gzip``（默认）：客户端未声明可用编码时用 gzip。gzip 被浏览器、小程序、
+      Node 等几乎所有 HTTP 客户端支持，是「稳妥」选项。
+    * ``br``：同上但用 brotli，体积更小（实测 /api/projects/ gzip 102.8KB vs
+      br 55.2KB），代价是依赖客户端支持 brotli，需确认后再启用。
+    * ``auto``：严格按 Accept-Encoding 协商（RFC 语义最正确，但在当前网关下
+      等于关闭压缩）。
+    * ``off``：完全关闭压缩。
+
+协商优先级（只要客户端**真的**声明了支持，就一定按声明来，此时才会用到 brotli）：
+    客户端声明 br → br；声明 gzip → gzip；声明 identity/未声明 → 走兜底策略。
+
+安全约束（改动时务必保持）
 --------------------------
-* **只压缩超过阈值的响应**。``/api/poll/`` 只有 74 字节，压缩后反而更大，
-  还会白耗云函数 CPU；阈值设为 1 KB。
-* **尊重 ``Accept-Encoding``**（含 q 值）。客户端没声明就不压缩，避免给不
-  支持的客户端发去无法解码的响应。
-* **brotli 是可选依赖**：导入失败时静默回落 gzip。缺一个可选包绝不能让整个
-   API 起不来（云函数起不来会返回网关 443，全部端点不可用）。
-* **任何压缩异常都退回原响应**：最坏情况只是「没压缩」。
-
-实测收益（``/api/projects/?limit=100``，1227.7 KB 原始）：
-brotli 57.2 KB（−95.3%）/ gzip 222.2 KB（−81.9%）。
+* 只压缩超过阈值的 JSON / 文本响应：``/api/poll/`` 只有百字节，压缩反而更大。
+* brotli 是可选依赖，缺失或压缩失败时回落 gzip；再失败就退回原响应。
+* 任何异常都退回原响应（压缩是纯优化），但**必须留日志**——静默失效会让排查
+  变成猜谜（本项目就经历过一次）。
 """
 
 from __future__ import annotations
 
 import gzip
 import logging
+import os
 import re
 
 logger = logging.getLogger(__name__)
@@ -39,6 +57,12 @@ MIN_COMPRESS_BYTES = 1024
 BROTLI_QUALITY = 5
 # gzip 级别 6（默认档）：与 brotli 对比时保持较快的压缩速度。
 GZIP_LEVEL = 6
+
+_FORCE_RAW = (os.getenv("RESPONSE_COMPRESSION_FORCE") or "gzip").strip().lower()
+if _FORCE_RAW not in {"gzip", "br", "auto", "off"}:
+    logger.warning("RESPONSE_COMPRESSION_FORCE=%r 不是合法取值，回退 gzip", _FORCE_RAW)
+    _FORCE_RAW = "gzip"
+FORCE_ENCODING = _FORCE_RAW
 
 # 只压缩文本类内容；二进制（图片等）压缩收益低且可能已被压缩过。
 _COMPRESSIBLE_TYPE = re.compile(
@@ -72,18 +96,12 @@ def _parse_accept_encoding(header: str) -> dict[str, float]:
     return accepted
 
 
-def pick_encoding(header: str) -> str | None:
-    """按 q 值选出编码；q 相同时优先 brotli（压缩率更高）。
-
-    ``Accept-Encoding: *`` 视作接受 gzip（brotli 不在通配范围内，因为并非所有
-    客户端都能解码 br）。
-    """
-    accepted = _parse_accept_encoding(header)
+def _by_quality(accepted: dict[str, float]) -> str | None:
+    """按 q 值择优；q 相同时优先 brotli（压缩率更高）。未声明返回 None。"""
     candidates: list[tuple[float, int, str]] = []
     if BROTLI_AVAILABLE:
         quality = accepted.get("br", 0.0)
         if quality > 0:
-            # 第二项是「同 q 值时的偏好序」，越大越优先。
             candidates.append((quality, 1, "br"))
     for name in ("gzip", "x-gzip"):
         quality = accepted.get(name, 0.0)
@@ -96,6 +114,27 @@ def pick_encoding(header: str) -> str | None:
         return None
     candidates.sort(reverse=True)
     return candidates[0][2]
+
+
+def pick_encoding(header: str) -> str | None:
+    """选择响应编码。
+
+    客户端真的声明了支持的编码时按声明择优（这才轮到 brotli）；
+    只声明 ``identity``（含网关强制改写的情况）或未声明时，走兜底策略。
+    返回 ``None`` 表示不压缩。
+    """
+    if FORCE_ENCODING == "off":
+        return None
+    accepted = _parse_accept_encoding(header)
+    chosen = _by_quality(accepted)
+    if chosen:
+        return chosen
+    # 到这里说明客户端（或中间网关）没有声明任何可用编码。
+    if FORCE_ENCODING == "auto":
+        return None
+    if FORCE_ENCODING == "br":
+        return "br" if BROTLI_AVAILABLE else "gzip"
+    return "gzip"
 
 
 def compress_body(body: bytes, encoding: str) -> bytes | None:
@@ -125,7 +164,7 @@ def _append_vary(response, value: str) -> None:
 
 
 class ResponseCompressionMiddleware:
-    """压缩 JSON / 文本响应，支持 brotli 与 gzip，可安全回落到不压缩。"""
+    """压缩 JSON / 文本响应；任何异常都退回原响应，绝不阻断业务。"""
 
     def __init__(self, get_response):
         self.get_response = get_response

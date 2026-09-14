@@ -52,9 +52,11 @@ def check(label: str, condition: bool, detail: str = "") -> None:
 
 # ————————————————————— 1. 编码协商 —————————————————————
 print("\n[1] 编码协商 pick_encoding")
+# 先测「严格协商」模式（auto）下的 RFC 语义。
+comp.FORCE_ENCODING = "auto"
 cases = [
-    ("", None, "未声明 → 不压缩"),
-    ("identity", None, "仅 identity → 不压缩"),
+    ("", None, "未声明且不兜底 → 不压缩"),
+    ("identity", None, "仅 identity 且不兜底 → 不压缩"),
     ("gzip", "gzip", "仅 gzip"),
     ("br", "br", "仅 br"),
     ("gzip, deflate, br", "br", "同 q 值 → 优先 brotli（体积更小）"),
@@ -80,6 +82,20 @@ check(
 check("brotli 不可用时 'br' 返回 None", comp.pick_encoding("br") is None)
 comp.BROTLI_AVAILABLE = saved_available
 comp._brotli = saved_brotli
+
+print("\n[1b] 兜底策略（网关把 Accept-Encoding 改写为 identity 的场景）")
+comp.FORCE_ENCODING = "gzip"
+check("identity → gzip（云端网关场景）", comp.pick_encoding("identity") == "gzip")
+check("未声明 → gzip", comp.pick_encoding("") == "gzip")
+check("客户端声明 br 时仍优先 br（真的能协商到就选更小的）", comp.pick_encoding("gzip, deflate, br") == "br")
+comp.FORCE_ENCODING = "br"
+check("兜底=br 时 identity → br", comp.pick_encoding("identity") == "br")
+comp.BROTLI_AVAILABLE = False
+check("兜底=br 但 brotli 缺失 → 仍回落 gzip", comp.pick_encoding("identity") == "gzip")
+comp.BROTLI_AVAILABLE = saved_available
+comp.FORCE_ENCODING = "off"
+check("兜底=off 时即使声明 br 也不压缩", comp.pick_encoding("gzip, deflate, br") is None)
+comp.FORCE_ENCODING = "gzip"
 
 # ————————————————————— 2. 压缩往返 —————————————————————
 print("\n[2] 压缩往返 compress_body")
@@ -139,7 +155,15 @@ decoded = json.loads(
 check("压缩后仍是合法 JSON 且内容一致", decoded == big_payload)
 
 plain = run(make_view())
-check("未声明 Accept-Encoding → 不压缩", plain.get("Content-Encoding") is None)
+check("未声明 Accept-Encoding → 按兜底策略压缩(gzip)", plain.get("Content-Encoding") == "gzip", f"实际 {plain.get('Content-Encoding')!r}")
+
+identity = run(make_view(), "identity")
+check("网关改写为 identity → 仍按兜底策略压缩(gzip)", identity.get("Content-Encoding") == "gzip", f"实际 {identity.get('Content-Encoding')!r}")
+
+comp.FORCE_ENCODING = "auto"
+strict = run(make_view(), "identity")
+check("兜底=auto 时 identity → 不压缩（严格 RFC 语义）", strict.get("Content-Encoding") is None)
+comp.FORCE_ENCODING = "gzip"
 
 tiny = run(make_view(content=b'{"ok":true,"revision":"1"}', content_type="application/json"), "gzip, br")
 check("小于阈值 → 不压缩（poll 场景）", tiny.get("Content-Encoding") is None)
